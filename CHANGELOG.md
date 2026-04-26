@@ -12,6 +12,13 @@ file automatically. The "Unreleased" section is what release-please
 will roll into the next tagged release.
 -->
 
+## [0.3.7](https://github.com/crgeee/gh-runner-status/compare/v0.3.6...v0.3.7) (2026-04-26)
+
+
+### Bug Fixes
+
+* stop dashboard auto-exiting + theme key + debug log + settings file ([#16](https://github.com/crgeee/gh-runner-status/issues/16)) ([191bab7](https://github.com/crgeee/gh-runner-status/commit/191bab7d161dbb2cfed7cbf2963ceca24eaffc05))
+
 ## [0.3.6](https://github.com/crgeee/gh-runner-status/compare/v0.3.5...v0.3.6) (2026-04-26)
 
 
