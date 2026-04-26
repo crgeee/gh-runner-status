@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-VERSION="0.3.3" # x-release-please-version
+VERSION="0.3.4" # x-release-please-version
 
 tmpdir=""
 trap 'rm -rf "${tmpdir:-}"' EXIT
