@@ -1,0 +1,103 @@
+name: CI
+
+# Workflow does NOT consume any user-controlled inputs (no issue titles,
+# PR bodies, commit messages, head_ref interpolation). Hardened against
+# workflow-injection by construction — every `run:` block uses only
+# trusted sources.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck gh-runner-status
+
+  test:
+    name: Tests (bats) on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bats jq
+
+      - name: Install bats (macOS)
+        if: runner.os == 'macOS'
+        run: brew install bats-core jq
+
+      - name: Run bats suite
+        run: bats tests/
+
+  coverage:
+    name: Coverage (kcov)
+    runs-on: ubuntu-latest
+    needs: test
+    # kcov isn't in the default Ubuntu noble repos. Building from source
+    # adds ~3 min to CI. Marked continue-on-error for now so the rest of
+    # CI doesn't block on a flaky coverage step. The branch-protection
+    # required-checks list does NOT include this job.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats jq cmake binutils-dev libcurl4-openssl-dev \
+            libdw-dev libelf-dev libiberty-dev libssl-dev python3 zlib1g-dev
+
+      - name: Build kcov from source
+        run: |
+          set -euo pipefail
+          KCOV_VERSION="v43"
+          curl -sSL "https://github.com/SimonKagstrom/kcov/archive/refs/tags/${KCOV_VERSION}.tar.gz" \
+            | tar xz
+          cd "kcov-${KCOV_VERSION#v}"
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release >/dev/null
+          make -j"$(nproc)" >/dev/null
+          sudo make install >/dev/null
+
+      - name: Run bats under kcov
+        run: |
+          mkdir -p coverage
+          kcov \
+            --include-path="$(pwd)/gh-runner-status" \
+            --bash-handle-sh-invocation \
+            coverage \
+            "$(command -v bats)" tests/
+
+      - name: Upload coverage HTML as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+      - name: Upload to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage/bats/cobertura.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}

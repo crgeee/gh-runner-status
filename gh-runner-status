@@ -1,54 +1,94 @@
 #!/usr/bin/env bash
-# gh-runner-status — show status of self-hosted GitHub Actions runners
-# across one or more repos.
+# gh-runner-status — list, control, and alert on self-hosted GitHub
+# Actions runners across one or more repositories.
 #
-# Usage:
-#   gh runner-status                     # use config file
-#   gh runner-status owner/repo          # single repo
-#   gh runner-status owner/repo[,...]    # multiple repos
-#   gh runner-status --config <file>     # custom config path
-#   gh runner-status --json              # raw JSON output
+# Subcommands:
+#   list / status (default)  show runner status table across repos
+#   local                    list runners installed on this machine
+#   start <NAME>             start a local runner
+#   stop <NAME>              stop a local runner
+#   restart <NAME>           restart a local runner
+#   logs <NAME>              tail recent logs from a local runner
+#   notify                   send a Telegram alert if any runner is offline
 #
-# Config file (one repo per line; '#' comments allowed):
-#   $XDG_CONFIG_HOME/gh-runner-status/repos
-#   ~/.config/gh-runner-status/repos     (fallback)
+# Run `gh runner-status --help` for full usage.
 
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 tmpdir=""
 trap 'rm -rf "${tmpdir:-}"' EXIT
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 usage() {
   cat <<'EOF'
-gh-runner-status — show self-hosted GitHub Actions runner status
+gh-runner-status — list, control, and alert on self-hosted Actions runners
 
 USAGE:
-  gh runner-status [REPOS...] [--config FILE] [--json] [--help]
+  gh runner-status [SUBCOMMAND] [ARGS...] [OPTIONS]
 
-ARGUMENTS:
-  REPOS    One or more "owner/name" repositories. Comma- or space-
-           separated. If omitted, reads from the config file.
+SUBCOMMANDS:
+  list, status (default)
+      Show runner status table across all configured repos. With repos
+      passed as args, only those are queried.
+
+  local
+      List self-hosted runners installed on the local machine
+      (LaunchAgents on macOS, systemd user services on Linux).
+
+  start NAME      Start a local runner by service name.
+  stop NAME       Stop a local runner.
+  restart NAME    Restart a local runner.
+  logs NAME       Tail the most recent stdout/stderr logs.
+
+  watch [SECONDS]
+      Auto-refresh the status table on an interval (default 30s).
+      Ctrl-C to exit.
+
+  notify
+      Query all configured repos and send a Telegram alert if any
+      runner is offline or errored. Designed for cron / launchd.
+
+  (no args, in a TTY)
+      Drops into an interactive REPL with slash commands and
+      short-form aliases. See in-REPL `/help` for details.
 
 OPTIONS:
   --config FILE   Read repos from FILE (one per line). Default:
-                  $XDG_CONFIG_HOME/gh-runner-status/repos or
-                  ~/.config/gh-runner-status/repos
-  --json          Print raw JSON instead of the table
-  --help          Show this message
+                  $XDG_CONFIG_HOME/gh-runner-status/repos
+                  or ~/.config/gh-runner-status/repos
+  --json          Print raw JSON instead of the table (list/local/notify)
+  --threshold N   For `notify`: only alert if N+ runners are offline
+                  (default 1)
+  -h, --help      Show this message
   --version       Show version
 
 EXAMPLES:
   gh runner-status
-  gh runner-status crgeee/sepa-screener
-  gh runner-status crgeee/dte0,crgeee/sepa-screener
+  gh runner-status owner/repo-a
+  gh runner-status owner/repo-a,owner/repo-b
   gh runner-status --json | jq '.[] | select(.status == "offline")'
+  gh runner-status local
+  gh runner-status restart actions.runner.owner-repo.runner-1
+  gh runner-status notify
 
 CONFIG FILE FORMAT:
-  # comments are ignored
-  crgeee/sepa-screener
-  crgeee/dte0
+  Lines beginning with '#' are comments. One "owner/repo" per line.
+
+      owner/repo-a
+      owner/repo-b
+
+TELEGRAM (optional, used by `notify`):
+  Set in env or in $XDG_CONFIG_HOME/gh-runner-status/telegram:
+
+      TELEGRAM_BOT_TOKEN=123456:ABC...
+      TELEGRAM_CHAT_ID=-1001234567890
+
+  Get a bot token from @BotFather; chat ID from @userinfobot.
 EOF
 }
 
@@ -59,9 +99,38 @@ require() {
   }
 }
 
+# Reject anything that doesn't look like "owner/repo" — keeps us from
+# building URLs like `repos/../../user/...` or accepting `?` / `#` in
+# the path. GitHub itself only allows [A-Za-z0-9._-] in owner and repo
+# names, so this is the canonical shape.
+validate_repo() {
+  local repo="$1"
+  if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "error: invalid repo (expected owner/name, got: $repo)" >&2
+    return 1
+  fi
+}
+
+# Block runner names that could be reparsed as flags by launchctl/
+# systemctl/tail (e.g. "--no-block", "default.target"). The GitHub
+# installer always names runners actions.runner.<owner>-<repo>.<runner>.
+validate_runner_name() {
+  local name="$1"
+  # Match `actions.runner.<owner>-<repo>.<runner>` exactly. Two segments
+  # after the prefix, neither may start with `-` (which would make the
+  # name reparse as a flag by launchctl/systemctl/tail).
+  if [[ ! "$name" =~ ^actions\.runner\.[A-Za-z0-9_][A-Za-z0-9_.-]*\.[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
+    echo "error: invalid runner name (expected actions.runner.OWNER-REPO.NAME, got: $name)" >&2
+    return 1
+  fi
+}
+
+config_dir() {
+  echo "${XDG_CONFIG_HOME:-$HOME/.config}/gh-runner-status"
+}
+
 config_path() {
-  local base="${XDG_CONFIG_HOME:-$HOME/.config}"
-  echo "$base/gh-runner-status/repos"
+  echo "$(config_dir)/repos"
 }
 
 read_config() {
@@ -71,16 +140,55 @@ read_config() {
     echo "create it with one 'owner/repo' per line, or pass repos as arguments" >&2
     exit 1
   fi
-  # strip comments (anything from # to end-of-line) and blank lines
+  # strip comments (# to end-of-line) and blank lines
   sed 's/#.*//' "$file" | awk 'NF > 0 { print $1 }'
 }
 
+# Source $XDG_CONFIG_HOME/gh-runner-status/telegram if it exists,
+# unless the env vars are already set.
+load_telegram_config() {
+  local cfg
+  cfg="$(config_dir)/telegram"
+  if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+    if [[ -f "$cfg" ]]; then
+      # Read KEY=VALUE pairs without sourcing arbitrary shell — `source`
+      # would let a malicious config run code (mkdir, curl, anything).
+      # Only accept TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, exact form.
+      while IFS='=' read -r key value; do
+        # Strip surrounding quotes and whitespace
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        value="${value#\"}"; value="${value%\"}"
+        value="${value#\'}"; value="${value%\'}"
+        value="${value%$'\r'}"  # tolerate Windows-edited config
+        case "$key" in
+          TELEGRAM_BOT_TOKEN)
+            [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]] && export TELEGRAM_BOT_TOKEN="$value"
+            ;;
+          TELEGRAM_CHAT_ID)
+            [[ -z "${TELEGRAM_CHAT_ID:-}" ]] && export TELEGRAM_CHAT_ID="$value"
+            ;;
+          ""|\#*) ;; # skip comments / blanks
+        esac
+      done < <(grep -E '^(TELEGRAM_(BOT_TOKEN|CHAT_ID)|#)' "$cfg" 2>/dev/null || true)
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Remote: fetch runners via gh API
+# ---------------------------------------------------------------------------
+
 fetch_runners() {
+  # Repo is validated upstream; this function may run in a backgrounded
+  # subshell where `exit` wouldn't propagate, so we don't re-validate here.
   local repo="$1"
   local response
   if ! response=$(gh api "repos/${repo}/actions/runners" --paginate 2>&1); then
-    # Surface the error inline so the user sees it in the table; do not
-    # crash the whole run on one bad repo.
+    # Surface the error inline so the user sees it; do not crash the
+    # whole run on one bad repo.
     jq -nc --arg repo "$repo" --arg err "$response" \
       '{repo: $repo, error: $err}'
     return
@@ -91,6 +199,28 @@ fetch_runners() {
     <<<"$response"
 }
 
+collect_remote_runners() {
+  # Args: list of repos. Outputs newline-delimited JSON to stdout.
+  local repos=("$@")
+  # Validate every repo upfront so a bad name fails fast before we
+  # spawn parallel API calls.
+  for repo in "${repos[@]}"; do
+    validate_repo "$repo" || return 1
+  done
+  tmpdir=$(mktemp -d)
+  local i=0
+  for repo in "${repos[@]}"; do
+    fetch_runners "$repo" >"$tmpdir/$i" &
+    i=$((i + 1))
+  done
+  wait
+  for f in "$tmpdir"/*; do
+    [[ -s "$f" ]] || continue
+    cat "$f"
+    echo  # ensure trailing newline between files
+  done
+}
+
 render_table() {
   local rows="$1"
   if [[ -z "$rows" ]]; then
@@ -98,118 +228,630 @@ render_table() {
     return
   fi
 
-  # Collect rows, compute column widths, render. Color the status column.
-  local repo_w=4 name_w=4 status_w=6 busy_w=4
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    local repo name status busy
-    repo=$(jq -r '.repo // "?"' <<<"$line")
-    name=$(jq -r '.name // .error // "?"' <<<"$line")
-    status=$(jq -r '.status // "error"' <<<"$line")
-    busy=$(jq -r 'if .busy == true then "yes" elif .busy == false then "no" else "-" end' <<<"$line")
-    [[ ${#repo}   -gt $repo_w   ]] && repo_w=${#repo}
-    [[ ${#name}   -gt $name_w   ]] && name_w=${#name}
-    [[ ${#status} -gt $status_w ]] && status_w=${#status}
-    [[ ${#busy}   -gt $busy_w   ]] && busy_w=${#busy}
-  done <<<"$rows"
+  # Single jq pass projects each row into TAB-delimited columns; awk
+  # handles column-width measurement and ANSI coloring in one stream.
+  # Avoids spawning ~5 jq processes per runner (was 500+ for 100 runners).
+  local color_enabled=0
+  [[ -t 1 ]] && color_enabled=1
 
-  printf "%-${repo_w}s  %-${name_w}s  %-${status_w}s  %-${busy_w}s  %s\n" \
-    "REPO" "NAME" "STATUS" "BUSY" "LABELS"
-  printf "%s\n" "$(printf '%*s' $((repo_w + name_w + status_w + busy_w + 20)) '' | tr ' ' '-')"
+  # Status icons add a glanceable signal column that pairs with the
+  # text status. Disabled with NO_ICONS=1 for environments that don't
+  # render unicode reliably (some CI log viewers, ASCII-only terminals).
+  local icons_enabled=1
+  [[ "${NO_ICONS:-0}" == "1" ]] && icons_enabled=0
 
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    local repo name status busy labels color reset
-    repo=$(jq -r '.repo // "?"' <<<"$line")
-    name=$(jq -r '.name // .error // "?"' <<<"$line")
-    status=$(jq -r '.status // "error"' <<<"$line")
-    busy=$(jq -r 'if .busy == true then "yes" elif .busy == false then "no" else "-" end' <<<"$line")
-    labels=$(jq -r 'if .labels then (.labels | join(",")) else "-" end' <<<"$line")
+  jq -rs '.[] |
+    [
+      (.repo // "?"),
+      (.name // .error // "?"),
+      (.status // "error"),
+      (if .busy == true then "yes" elif .busy == false then "no" else "-" end),
+      (if .labels then (.labels | join(",")) else "-" end)
+    ] | @tsv' <<<"$rows" \
+  | awk -F'\t' -v color="$color_enabled" -v icons="$icons_enabled" '
+    BEGIN { wi=2; wr=4; wn=4; ws=6; wb=4 }
+    {
+      lines[NR] = $0
+      if (length($1) > wr) wr = length($1)
+      if (length($2) > wn) wn = length($2)
+      if (length($3) > ws) ws = length($3)
+      if (length($4) > wb) wb = length($4)
+    }
+    function icon_for(status) {
+      if (!icons) return ""
+      if (status == "online")  return "✓"
+      if (status == "offline") return "✗"
+      if (status == "error")   return "⚠"
+      return "•"
+    }
+    END {
+      hdr_icon = icons ? "  " : ""
+      printf "%s%-*s  %-*s  %-*s  %-*s  %s\n", hdr_icon, wr, "REPO", wn, "NAME", ws, "STATUS", wb, "BUSY", "LABELS"
+      total = (icons ? 4 : 0) + wr + wn + ws + wb + 20
+      for (i = 0; i < total; i++) printf "-"
+      printf "\n"
+      for (i = 1; i <= NR; i++) {
+        split(lines[i], f, "\t")
+        c = ""; r = ""
+        if (color) {
+          r = "\033[0m"
+          if (f[3] == "online")  c = "\033[32m"
+          else if (f[3] == "offline") c = "\033[31m"
+          else if (f[3] == "error")   c = "\033[33m"
+        }
+        ic = icon_for(f[3])
+        if (icons) printf "%s%s ", c, ic
+        printf "%s%-*s%s  %-*s  %s%-*s%s  %-*s  %s\n", \
+          (icons ? r : ""), wr, f[1], "", wn, f[2], c, ws, f[3], r, wb, f[4], f[5]
+      }
+    }'
+}
 
-    color=""
-    reset=""
-    if [[ -t 1 ]]; then
-      reset=$'\033[0m'
-      case "$status" in
-        online)  color=$'\033[32m' ;;  # green
-        offline) color=$'\033[31m' ;;  # red
-        error)   color=$'\033[33m' ;;  # yellow
+# ---------------------------------------------------------------------------
+# Local: discover and control runners installed on this machine
+# ---------------------------------------------------------------------------
+
+detect_os() {
+  case "$(uname -s)" in
+    Darwin) echo "macos" ;;
+    Linux)  echo "linux" ;;
+    *)      echo "unsupported" ;;
+  esac
+}
+
+list_local_runners() {
+  local os
+  os=$(detect_os)
+  case "$os" in
+    macos)
+      # GitHub's installer drops a plist named `actions.runner.<owner>-<repo>.<runner>.plist`
+      local agents_dir="$HOME/Library/LaunchAgents"
+      [[ -d "$agents_dir" ]] || return 0
+      find "$agents_dir" -maxdepth 1 -name 'actions.runner.*.plist' -print 2>/dev/null \
+        | sed 's|.*/||;s|\.plist$||'
+      ;;
+    linux)
+      # systemctl pattern; user services first, then system. Dedupe
+      # output so a runner registered in both managers doesn't appear
+      # twice. `|| true` swallows missing-D-Bus-session failures
+      # (common under cron without lingering enabled).
+      {
+        systemctl --user list-units --type=service --all --no-legend 'actions.runner.*' 2>/dev/null || true
+        systemctl list-units --type=service --all --no-legend 'actions.runner.*' 2>/dev/null || true
+      } | awk '{print $1}' | sed 's|\.service$||' | awk 'NF' | sort -u
+      ;;
+    *)
+      echo "error: local runner control not supported on this OS" >&2
+      return 1
+      ;;
+  esac
+}
+
+local_runner_action() {
+  local action="$1" name="$2"
+  validate_runner_name "$name"
+  local os
+  os=$(detect_os)
+  case "$os" in
+    macos)
+      local agents_dir="$HOME/Library/LaunchAgents"
+      local plist="$agents_dir/${name}.plist"
+      if [[ ! -f "$plist" ]]; then
+        echo "error: no LaunchAgent at $plist" >&2
+        echo "Run \`gh runner-status local\` to see installed runners." >&2
+        return 1
+      fi
+      local uid target
+      uid=$(id -u)
+      target="gui/${uid}/${name}"
+      case "$action" in
+        start)
+          launchctl bootstrap "gui/$(id -u)" "$plist" 2>&1 \
+            | grep -v "service already loaded" || true
+          echo "started: $name"
+          ;;
+        stop)
+          launchctl bootout "$target" 2>&1 \
+            | grep -v "Could not find specified service" || true
+          echo "stopped: $name"
+          ;;
+        restart)
+          launchctl bootout "$target" 2>/dev/null || true
+          launchctl bootstrap "gui/$(id -u)" "$plist"
+          echo "restarted: $name"
+          ;;
       esac
+      ;;
+    linux)
+      case "$action" in
+        start)   systemctl --user start "$name" 2>/dev/null || sudo systemctl start "$name" ;;
+        stop)    systemctl --user stop "$name" 2>/dev/null || sudo systemctl stop "$name" ;;
+        restart) systemctl --user restart "$name" 2>/dev/null || sudo systemctl restart "$name" ;;
+      esac
+      echo "${action}ed: $name"
+      ;;
+    *)
+      echo "error: local runner control not supported on this OS" >&2
+      return 1
+      ;;
+  esac
+}
+
+local_runner_logs() {
+  local name="$1"
+  validate_runner_name "$name"
+  local os
+  os=$(detect_os)
+  case "$os" in
+    macos)
+      local logs_dir="$HOME/Library/Logs/${name}"
+      if [[ ! -d "$logs_dir" ]]; then
+        echo "error: no logs at $logs_dir" >&2
+        return 1
+      fi
+      # Show last 50 lines from each log file
+      for f in "$logs_dir"/*.log; do
+        [[ -f "$f" ]] || continue
+        echo "── $f ──"
+        tail -n 50 "$f"
+        echo
+      done
+      ;;
+    linux)
+      journalctl --user -u "$name" -n 100 --no-pager 2>/dev/null \
+        || journalctl -u "$name" -n 100 --no-pager
+      ;;
+    *)
+      echo "error: log retrieval not supported on this OS" >&2
+      return 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Notify: send Telegram alert on offline/errored runners
+# ---------------------------------------------------------------------------
+
+telegram_send() {
+  local message="$1"
+  # Strip CR (Windows-edited config) which would corrupt the URL.
+  local token="${TELEGRAM_BOT_TOKEN%$'\r'}"
+  local chat="${TELEGRAM_CHAT_ID%$'\r'}"
+  if [[ -z "$token" || -z "$chat" ]]; then
+    echo "error: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID required" >&2
+    echo "set them in env or $(config_dir)/telegram" >&2
+    return 1
+  fi
+
+  # Write the message to a temp file and pass via `data-urlencode = "text@FILE"`.
+  # curl reads the file's contents and url-encodes them — handles arbitrary
+  # newlines, quotes, and backslashes that would otherwise break the
+  # line-oriented config syntax. Token still lands via stdin (--config -),
+  # not argv, so `ps auxe` can't see it.
+  local msg_file
+  msg_file=$(mktemp)
+  # Trap-local cleanup; don't disturb the script-level EXIT trap that
+  # cleans up tmpdir.
+  printf '%s' "$message" >"$msg_file"
+
+  local http
+  http=$(curl -sS -X POST --config - -o /dev/null -w '%{http_code}' <<EOF
+url = "https://api.telegram.org/bot${token}/sendMessage"
+data-urlencode = "chat_id=${chat}"
+data-urlencode = "text@${msg_file}"
+data-urlencode = "disable_notification=false"
+EOF
+)
+  rm -f "$msg_file"
+  [[ "$http" == "200" ]]
+}
+
+run_notify() {
+  local repos=("$@")
+  local rows
+  rows=$(collect_remote_runners "${repos[@]}")
+  local threshold="${NOTIFY_THRESHOLD:-1}"
+
+  # Count separately so "all repos errored" doesn't masquerade as healthy.
+  local counts
+  counts=$(jq -rs '
+    {
+      total:    length,
+      offline: ([.[] | select(.status == "offline")] | length),
+      err:     ([.[] | select(has("error"))] | length)
+    } | "\(.total) \(.offline) \(.err)"
+  ' <<<"$rows" 2>/dev/null || echo "0 0 0")
+  local total offline_count error_count
+  read -r total offline_count error_count <<<"$counts"
+  local bad_count=$(( offline_count + error_count ))
+
+  # Edge case: every repo errored (bad token / network down). Always
+  # alert regardless of threshold — silent failure is the worst outcome.
+  # fetch_runners emits one {repo, error} object per failed repo, so
+  # error_count == #repos AND offline_count == 0 means total failure.
+  local total_repo_failure=0
+  if [[ $error_count -ge ${#repos[@]} && $offline_count -eq 0 ]]; then
+    total_repo_failure=1
+  fi
+
+  if [[ $total_repo_failure -eq 0 && $bad_count -lt $threshold ]]; then
+    local online_count=$(( total - offline_count - error_count ))
+    echo "ok: $online_count runner(s) online across ${#repos[@]} repo(s)"
+    return 0
+  fi
+
+  local detail
+  detail=$(jq -rs '
+    [.[] | select(.status == "offline" or has("error"))]
+    | map("• \(.repo) / \(.name // "?") — \(.error // .status)")
+    | .[]
+  ' <<<"$rows")
+
+  local short_host
+  short_host=${HOSTNAME%%.*}
+  [[ -z "$short_host" ]] && short_host=$(hostname 2>/dev/null || echo "unknown")
+
+  local headline
+  if [[ $total_repo_failure -eq 1 ]]; then
+    headline="🚨 gh-runner-status: ALL repo lookups failed"
+  else
+    headline="🚨 gh-runner-status: ${bad_count} runner(s) need attention"
+  fi
+
+  local online_count=$(( total - offline_count - error_count ))
+  local message
+  message="${headline}
+Host: ${short_host}
+Online: ${online_count}/${total}; Offline: ${offline_count}; Errored: ${error_count}
+
+${detail}"
+
+  echo "$message"
+  echo "---"
+  if telegram_send "$message"; then
+    echo "alert sent to Telegram"
+  else
+    echo "error: telegram_send failed (HTTP non-200)" >&2
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand dispatch — shared between one-shot CLI and interactive REPL
+# ---------------------------------------------------------------------------
+
+# Args: <subcommand> [positional...]. Reads CONFIG_FILE, JSON_OUTPUT,
+# NOTIFY_THRESHOLD from the environment. Returns 0 on success, 1 on
+# user error, 2 on bad args. Never calls exit; the REPL needs to
+# survive errors.
+dispatch_subcommand() {
+  local subcommand="$1"; shift
+  local positional=("$@")
+
+  case "$subcommand" in
+    list|status)
+      local repos=()
+      if [[ ${#positional[@]} -gt 0 ]]; then
+        for arg in "${positional[@]}"; do
+          while IFS= read -r r; do
+            [[ -n "$r" ]] && repos+=("$r")
+          done < <(tr ',' '\n' <<<"$arg")
+        done
+      else
+        while IFS= read -r r; do
+          [[ -n "$r" ]] && repos+=("$r")
+        done < <(read_config "${CONFIG_FILE:-$(config_path)}" 2>&1) || return 1
+      fi
+
+      if [[ ${#repos[@]} -eq 0 ]]; then
+        echo "error: no repos (pass as args or populate ${CONFIG_FILE:-$(config_path)})" >&2
+        return 1
+      fi
+
+      local rows
+      rows=$(collect_remote_runners "${repos[@]}") || return 1
+
+      if [[ "${JSON_OUTPUT:-0}" -eq 1 ]]; then
+        if [[ -z "$rows" ]]; then echo "[]"; else jq -s '.' <<<"$rows"; fi
+      else
+        render_table "$rows"
+      fi
+      ;;
+
+    local)
+      if [[ "${JSON_OUTPUT:-0}" -eq 1 ]]; then
+        list_local_runners | jq -Rn '[inputs | select(length > 0) | {name: .}]'
+      else
+        local found=0
+        while IFS= read -r r; do
+          [[ -z "$r" ]] && continue
+          echo "$r"
+          found=1
+        done < <(list_local_runners)
+        [[ $found -eq 0 ]] && echo "(no local runners found)"
+      fi
+      ;;
+
+    start|stop|restart)
+      if [[ ${#positional[@]} -ne 1 ]]; then
+        echo "error: $subcommand requires exactly one runner name" >&2
+        echo "use \`local\` to list installed runners" >&2
+        return 2
+      fi
+      local_runner_action "$subcommand" "${positional[0]}"
+      ;;
+
+    logs)
+      if [[ ${#positional[@]} -ne 1 ]]; then
+        echo "error: logs requires exactly one runner name" >&2
+        return 2
+      fi
+      local_runner_logs "${positional[0]}"
+      ;;
+
+    watch)
+      # Auto-refresh status table every N seconds (default 30).
+      local interval="${WATCH_INTERVAL:-30}"
+      if [[ "${positional[0]:-}" =~ ^[0-9]+$ ]]; then
+        interval="${positional[0]}"
+        positional=("${positional[@]:1}")
+      fi
+      command -v clear >/dev/null 2>&1 || {
+        echo "error: 'clear' is required for watch mode" >&2
+        return 2
+      }
+      while true; do
+        clear
+        printf '\033[2m▸ gh-runner-status watch (every %ss) — Ctrl-C to exit\033[0m\n' "$interval"
+        date '+%Y-%m-%d %H:%M:%S %Z'
+        echo
+        dispatch_subcommand list ${positional[@]:+"${positional[@]}"} || true
+        sleep "$interval"
+      done
+      ;;
+
+    notify)
+      load_telegram_config
+      command -v curl >/dev/null 2>&1 || {
+        echo "error: 'curl' is required for notify" >&2
+        return 2
+      }
+      local repos=()
+      if [[ ${#positional[@]} -gt 0 ]]; then
+        for arg in "${positional[@]}"; do
+          while IFS= read -r r; do
+            [[ -n "$r" ]] && repos+=("$r")
+          done < <(tr ',' '\n' <<<"$arg")
+        done
+      else
+        while IFS= read -r r; do
+          [[ -n "$r" ]] && repos+=("$r")
+        done < <(read_config "${CONFIG_FILE:-$(config_path)}" 2>&1) || return 1
+      fi
+
+      if [[ ${#repos[@]} -eq 0 ]]; then
+        echo "error: no repos given for notify" >&2
+        return 1
+      fi
+
+      run_notify "${repos[@]}"
+      ;;
+
+    *)
+      echo "error: unknown command '$subcommand'" >&2
+      echo "type /help for available commands" >&2
+      return 2
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Interactive mode (REPL)
+# ---------------------------------------------------------------------------
+
+repl_help() {
+  cat <<'EOF'
+Slash commands:
+  /help, /?      Show this help
+  /repos         Show configured repos
+  /clear         Clear the screen
+  /quit, /exit   Exit (also: Ctrl-D)
+
+Inline commands (same shape as the one-shot CLI):
+  list, status         Show runner status table
+  local                List runners installed on this machine
+  start NAME           Start a local runner
+  stop NAME            Stop a local runner
+  restart NAME         Restart a local runner
+  logs NAME            Tail recent logs
+  watch [SECONDS]      Auto-refresh status table (default 30s)
+  notify               Send Telegram alert if any runner is offline
+
+Aliases: `l`/`ls`=list, `r`=restart, `s`=start, `x`=stop, `n`=notify,
+`w`=watch.
+
+Tip: bare `gh runner-status` enters this REPL; pass a subcommand to
+run one-shot.
+EOF
+}
+
+interactive_mode() {
+  local has_color=0
+  [[ -t 1 ]] && has_color=1
+
+  if [[ $has_color -eq 1 ]]; then
+    printf '\033[1;36m▸ gh-runner-status\033[0m \033[2mv%s\033[0m\n' "$VERSION"
+    printf '\033[2mtype /help for commands • Ctrl-D to exit\033[0m\n\n'
+  else
+    printf 'gh-runner-status v%s — type /help for commands, Ctrl-D to exit\n\n' "$VERSION"
+  fi
+
+  local prompt
+  if [[ $has_color -eq 1 ]]; then
+    prompt=$'\001\033[36m\002❯\001\033[0m\002 '
+  else
+    prompt='> '
+  fi
+
+  while true; do
+    local line
+    if ! IFS= read -r -e -p "$prompt" line; then
+      [[ $has_color -eq 1 ]] && printf '\n'
+      break
     fi
 
-    printf "%-${repo_w}s  %-${name_w}s  ${color}%-${status_w}s${reset}  %-${busy_w}s  %s\n" \
-      "$repo" "$name" "$status" "$busy" "$labels"
-  done <<<"$rows"
+    # Trim leading/trailing whitespace
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+
+    # Save into bash history so up-arrow works
+    history -s -- "$line" 2>/dev/null || true
+
+    case "$line" in
+      /help|/?|help|"?")
+        repl_help
+        ;;
+      /quit|/exit|exit|quit)
+        [[ $has_color -eq 1 ]] && printf '\033[2mbye!\033[0m\n' || echo "bye!"
+        break
+        ;;
+      /clear|clear)
+        clear
+        ;;
+      /repos)
+        local f="${CONFIG_FILE:-$(config_path)}"
+        if [[ -f "$f" ]]; then
+          echo "# $f"
+          cat "$f"
+        else
+          echo "(no config file at $f — run \`echo OWNER/REPO > $f\`)"
+        fi
+        ;;
+      /*)
+        echo "unknown slash command: $line"
+        echo "type /help"
+        ;;
+      *)
+        # Tokenize via xargs printf so quoted strings work, e.g.
+        # `restart "actions.runner.foo bar.baz"` (we still validate names later).
+        local words=()
+        while IFS= read -r w; do
+          [[ -n "$w" ]] && words+=("$w")
+        done < <(printf '%s' "$line" | xargs -n 1 printf '%s\n' 2>/dev/null || printf '%s' "$line")
+
+        if [[ ${#words[@]} -eq 0 ]]; then
+          continue
+        fi
+
+        # First token is the subcommand; rest are positional args.
+        # Allow bare repo args to default to `list`. Short aliases keep
+        # the REPL snappy: `l`/`ls` → list, `r` → restart, etc.
+        local first="${words[0]}"
+        case "$first" in
+          l|ls)        words[0]="list" ;;
+          r)           words[0]="restart" ;;
+          s)           words[0]="start" ;;
+          x|stop)      words[0]="stop" ;;
+          n)           words[0]="notify" ;;
+          w)           words[0]="watch" ;;
+        esac
+        case "${words[0]}" in
+          list|status|local|start|stop|restart|logs|notify|watch)
+            dispatch_subcommand "${words[@]}" || true
+            ;;
+          *)
+            dispatch_subcommand list "${words[@]}" || true
+            ;;
+        esac
+        ;;
+    esac
+  done
 }
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 main() {
   require gh
   require jq
 
-  local config_file
-  config_file=$(config_path)
-  local json_output=0
-  local repos_arg=()
+  CONFIG_FILE=$(config_path)
+  JSON_OUTPUT=0
+  local subcommand=""
+  local positional=()
 
+  # Parse flags first; allow them anywhere
+  local args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) usage; exit 0 ;;
       --version) echo "gh-runner-status $VERSION"; exit 0 ;;
-      --json) json_output=1; shift ;;
-      --config) config_file="$2"; shift 2 ;;
-      --config=*) config_file="${1#--config=}"; shift ;;
+      --json) JSON_OUTPUT=1; shift ;;
+      --config)
+        if [[ $# -lt 2 ]]; then
+          echo "error: --config requires a value" >&2
+          exit 2
+        fi
+        CONFIG_FILE="$2"; shift 2 ;;
+      --config=*) CONFIG_FILE="${1#--config=}"; shift ;;
+      --threshold)
+        if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ ]]; then
+          echo "error: --threshold requires a non-negative integer" >&2
+          exit 2
+        fi
+        NOTIFY_THRESHOLD="$2"; shift 2 ;;
+      --threshold=*)
+        NOTIFY_THRESHOLD="${1#--threshold=}"
+        if [[ ! "$NOTIFY_THRESHOLD" =~ ^[0-9]+$ ]]; then
+          echo "error: --threshold requires a non-negative integer" >&2
+          exit 2
+        fi
+        shift ;;
+      --) shift; while [[ $# -gt 0 ]]; do args+=("$1"); shift; done ;;
       -*) echo "error: unknown option '$1'" >&2; exit 2 ;;
-      *) repos_arg+=("$1"); shift ;;
+      *) args+=("$1"); shift ;;
     esac
   done
 
-  local repos=()
-  if [[ ${#repos_arg[@]} -gt 0 ]]; then
-    # Allow comma-separated as well as space-separated. Split each
-    # arg on commas, drop empties.
-    for arg in "${repos_arg[@]}"; do
-      while IFS= read -r r; do
-        [[ -n "$r" ]] && repos+=("$r")
-      done < <(tr ',' '\n' <<<"$arg")
-    done
-  else
-    while IFS= read -r r; do
-      [[ -n "$r" ]] && repos+=("$r")
-    done < <(read_config "$config_file")
-  fi
-
-  if [[ ${#repos[@]} -eq 0 ]]; then
-    echo "error: no repos given (pass as args or populate $config_file)" >&2
-    exit 1
-  fi
-
-  # Fetch in parallel — bg subshells, collect into a single buffer.
-  # tmpdir is set as an env var (not local) so the EXIT trap defined at
-  # top scope can reference it after main returns.
-  tmpdir=$(mktemp -d)
-
-  local i=0
-  for repo in "${repos[@]}"; do
-    fetch_runners "$repo" >"$tmpdir/$i" &
-    i=$((i + 1))
-  done
-  wait
-
-  local all_rows=""
-  for f in "$tmpdir"/*; do
-    [[ -s "$f" ]] || continue
-    all_rows+="$(cat "$f")"$'\n'
-  done
-
-  if [[ $json_output -eq 1 ]]; then
-    if [[ -z "$all_rows" ]]; then
-      echo "[]"
-    else
-      jq -s '.' <<<"$all_rows"
+  # First non-flag arg may be a subcommand. If there's no arg AND stdin
+  # is a TTY, drop into the REPL — that's the "just like Claude Code"
+  # interactive experience. Non-TTY (cron, pipes) defaults to `list`
+  # so existing scripts keep working.
+  if [[ ${#args[@]} -eq 0 ]]; then
+    if [[ -t 0 && -t 1 ]]; then
+      interactive_mode
+      exit 0
     fi
+    subcommand="list"
   else
-    render_table "$all_rows"
+    case "${args[0]}" in
+      list|status|local|start|stop|restart|logs|notify|watch)
+        subcommand="${args[0]}"
+        positional=("${args[@]:1}")
+        ;;
+      *)
+        subcommand="list"
+        positional=("${args[@]}")
+        ;;
+    esac
   fi
+
+  # macOS bash 3.2 errors on `"${empty[@]}"` under set -u; ${var:+...}
+  # makes the expansion safe whether positional is empty or populated.
+  dispatch_subcommand "$subcommand" ${positional[@]:+"${positional[@]}"}
+  local rc=$?
+  # Surface validation/usage errors as exit 2 (matches CLI norms);
+  # other non-zero returns become exit 1.
+  if [[ $rc -ne 0 ]]; then
+    exit 2
+  fi
+  exit 0
 }
 
-main "$@"
+# Guard so test files can source the script for unit-testing functions
+# without triggering the full CLI execution.
+if [[ -z "${GH_RUNNER_STATUS_NO_MAIN:-}" ]]; then
+  main "$@"
+fi
