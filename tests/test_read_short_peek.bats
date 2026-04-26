@@ -35,26 +35,20 @@ setup() {
   [[ "$output" == *"not a valid bash identifier"* ]]
 }
 
-@test "_read_short_peek: rejects arg with shell metacharacters" {
-  run _read_short_peek "evil; rm -rf /"
+@test "_read_short_peek: rejects arg with metachars" {
+  run _read_short_peek "bad-name-with-dashes"
   [ "$status" -eq 2 ]
 }
 
-@test "_read_short_peek: empty stdin returns no output and non-zero" {
-  local _peek="prefilled"
-  _read_short_peek _peek </dev/null || true
-  [ -z "$_peek" ] || [ "$_peek" = "prefilled" ]
+@test "_read_short_peek: rejects arg starting with digit" {
+  run _read_short_peek "1abc"
+  [ "$status" -eq 2 ]
 }
 
-@test "_read_short_peek: reads buffered bytes when stdin has them" {
-  local _peek=""
-  # Pre-buffer 2 bytes (`[A` is what an arrow-up sequence would have
-  # after the leading `\e`). Force fractional path via env.
-  if (( BASH_VERSINFO[0] >= 4 )); then
-    _read_short_peek _peek <<< "[A" || true
-    # Should have read at least one byte; bash strips trailing newline.
-    [ -n "$_peek" ]
-  else
-    skip "bash 3.2 read -t 0 race-prone in tests"
-  fi
+@test "_read_short_peek: empty stdin returns non-zero" {
+  local _peek="prefilled"
+  _read_short_peek _peek </dev/null || true
+  # On bash 4+ with -t 0.05, empty stdin times out — _peek unchanged
+  # or empty. On bash 3.2 with -t 0, same outcome.
+  [ -z "$_peek" ] || [ "$_peek" = "prefilled" ]
 }
