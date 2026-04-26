@@ -27,6 +27,69 @@ jobs:
       - name: shellcheck
         run: shellcheck gh-runner-status
 
+  bash32-portability:
+    name: Bash 3.2 portability lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Catch bash-4+ patterns that break on macOS default bash
+        run: |
+          set -e
+          # Lines containing `bash4-ok` annotation are intentional uses
+          # gated behind a bash-version check. Pure-comment lines are
+          # ignored too. Scans every shipped bash entrypoint, not just
+          # the main script — completions also need to work on bash 3.2.
+          BASH_SOURCES=(
+            gh-runner-status
+            completions/gh-runner-status.bash
+          )
+          scan() {
+            # grep -nH emits "path:lineno:content"; awk drops lines
+            # where content (everything after the second `:`) is just
+            # a comment. Bash4-ok annotated lines are also dropped.
+            grep -nHE "$1" "${BASH_SOURCES[@]}" \
+              | grep -v 'bash4-ok' \
+              | awk -F: '{
+                  s = $0
+                  # strip path:lineno: prefix
+                  sub(/^[^:]*:[0-9]+:/, "", s)
+                  # skip whitespace then check first non-blank char
+                  sub(/^[[:space:]]+/, "", s)
+                  if (substr(s, 1, 1) != "#") print
+                }' || true
+          }
+          fail=0
+          out=$(scan 'read[[:space:]][^|;]*-t[[:space:]]+[0-9]+\.[0-9]')
+          if [[ -n "$out" ]]; then
+            echo "::error::Fractional 'read -t' timeouts are bash 4+ only — use _read_short_peek or an integer timeout. Add # bash4-ok if intentional."
+            echo "$out"; fail=1
+          fi
+          out=$(scan '^[[:space:]]*(mapfile|readarray)[[:space:]]')
+          if [[ -n "$out" ]]; then
+            echo "::error::mapfile/readarray are bash 4+ only — use a while-read loop"
+            echo "$out"; fail=1
+          fi
+          out=$(scan '\$\{[A-Za-z_][A-Za-z0-9_]*\^\^?\}|\$\{[A-Za-z_][A-Za-z0-9_]*,,?\}')
+          if [[ -n "$out" ]]; then
+            echo "::error::\${var^^} / \${var,,} case-conversion expansions are bash 4+ only — use tr or awk"
+            echo "$out"; fail=1
+          fi
+          out=$(scan '^[[:space:]]*(declare|local)[[:space:]]+-[a-zA-Z]*n[a-zA-Z]*[[:space:]]')
+          if [[ -n "$out" ]]; then
+            echo "::error::declare/local -n namerefs are bash 4.3+ only — pass values explicitly"
+            echo "$out"; fail=1
+          fi
+          out=$(scan 'read[[:space:]][^|;]*-i[[:space:]]')
+          if [[ -n "$out" ]]; then
+            echo "::error::'read -i' (initial buffer) is bash 4+ only — print prefix manually before read"
+            echo "$out"; fail=1
+          fi
+          if [[ $fail -eq 0 ]]; then
+            echo "✓ no bash-3.2-incompatible patterns found"
+          else
+            exit 1
+          fi
+
   test:
     name: Tests (bats) on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
