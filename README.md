@@ -195,6 +195,23 @@ Drop into cron:
 
 `--threshold N` only alerts when ≥N runners are offline. Errored repo lookups (e.g. expired token) always alert regardless of threshold — silent failure is the worst outcome.
 
+## Themes
+
+Three themes pick the color palette for the dashboard, table, and prompts:
+
+| Theme | When to use |
+|---|---|
+| `dark` (default) | Dark-background terminals — bright cyan banner, vivid green/red/yellow status |
+| `light` | Light-background terminals — bold blue banner, less dim grey |
+| `neon` | Maximum pop — hot pink banner, bright cyan prompts, vivid greens/reds/oranges |
+
+```bash
+GH_RUNNER_STATUS_THEME=neon gh runner-status
+echo 'export GH_RUNNER_STATUS_THEME=neon' >> ~/.zshrc    # make it stick
+```
+
+Status icons (`✓`/`✗`/`⚠`) prefix each row when stdout is a TTY. Set `NO_ICONS=1` to disable for ASCII-only environments.
+
 ## Shell autocomplete
 
 ```bash
