@@ -29,10 +29,12 @@ fi
 
 # Debug log. Enable with GH_RUNNER_STATUS_DEBUG=1 to capture
 # dashboard events (key presses, EOF, refreshes, quit transitions)
-# to $XDG_STATE_HOME/gh-runner-status/debug.log. Useful when the
-# dashboard misbehaves — e.g. exits unexpectedly, refresh stalls.
+# to $XDG_STATE_HOME/gh-runner-status/debug.log. Capped at 1MB —
+# when full we rotate to debug.log.1 and start fresh, so a
+# long-running dashboard can't fill the disk.
 DEBUG_LOG_ENABLED="${GH_RUNNER_STATUS_DEBUG:-0}"
 DEBUG_LOG_PATH=""
+DEBUG_LOG_MAX_BYTES="${GH_RUNNER_STATUS_DEBUG_MAX_BYTES:-1048576}"
 if [[ "$DEBUG_LOG_ENABLED" == "1" ]]; then
   _debug_dir="${XDG_STATE_HOME:-$HOME/.local/state}/gh-runner-status"
   if mkdir -p "$_debug_dir" 2>/dev/null; then
@@ -42,6 +44,16 @@ fi
 
 dlog() {
   [[ "$DEBUG_LOG_ENABLED" == "1" && -n "$DEBUG_LOG_PATH" ]] || return 0
+  # Rotate if oversized. Cheap stat; only on every call and only
+  # noticeable at startup of a fresh dashboard. Keep one rotation
+  # generation (debug.log → debug.log.1).
+  if [[ -f "$DEBUG_LOG_PATH" ]]; then
+    local sz
+    sz=$(stat -f %z "$DEBUG_LOG_PATH" 2>/dev/null || stat -c %s "$DEBUG_LOG_PATH" 2>/dev/null || echo 0)
+    if (( sz > DEBUG_LOG_MAX_BYTES )); then
+      mv -f "$DEBUG_LOG_PATH" "${DEBUG_LOG_PATH}.1" 2>/dev/null || true
+    fi
+  fi
   printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >>"$DEBUG_LOG_PATH" 2>/dev/null || true
 }
 
@@ -57,15 +69,24 @@ _load_settings() {
   local cfg
   cfg=$(_settings_path)
   [[ -f "$cfg" ]] || return 0
-  # Parse safely: only known keys, no shell sourcing.
+  # Parse safely: only known keys, no shell sourcing. Validate values
+  # against an allowlist so a malformed file (or CRLF from a Windows
+  # editor) can't pollute the environment.
   while IFS='=' read -r key value; do
     key="${key#"${key%%[![:space:]]*}"}"
     key="${key%"${key##*[![:space:]]}"}"
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"
+    value="${value%$'\r'}"  # tolerate CRLF
     case "$key" in
       theme)
-        [[ -z "${GH_RUNNER_STATUS_THEME:-}" ]] && export GH_RUNNER_STATUS_THEME="$value"
+        # Only accept the known themes; unknown values are dropped
+        # (a leftover dashboard would render with the dark fallback).
+        case "$value" in
+          dark|light|neon)
+            [[ -z "${GH_RUNNER_STATUS_THEME:-}" ]] && export GH_RUNNER_STATUS_THEME="$value"
+            ;;
+        esac
         ;;
       ""|\#*) ;;
     esac
@@ -76,19 +97,25 @@ _save_setting() {
   local key="$1" value="$2"
   local cfg
   cfg=$(_settings_path)
-  mkdir -p "$(dirname "$cfg")" 2>/dev/null || true
+  mkdir -p "$(dirname "$cfg")" || return 1
   local tmp
   tmp=$(mktemp "${cfg}.XXXXXX") || return 1
   if [[ -f "$cfg" ]]; then
     grep -v "^${key}=" "$cfg" >"$tmp" 2>/dev/null || true
   fi
-  printf '%s=%s\n' "$key" "$value" >>"$tmp"
-  mv -f "$tmp" "$cfg"
+  if ! printf '%s=%s\n' "$key" "$value" >>"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$cfg" || { rm -f "$tmp"; return 1; }
 }
 
-# Initialize settings + theme. Settings load first so the env var
-# (set inline by user) can override.
-_load_settings
+# Initialize settings + theme. Skip when source-loaded by tests
+# (NO_MAIN) so the bats suite doesn't pull in the developer's real
+# ~/.config and break hermeticity.
+if [[ -z "${GH_RUNNER_STATUS_NO_MAIN:-}" ]]; then
+  _load_settings
+fi
 
 # Read up to 2 bytes with a short timeout into the named variable.
 # Used to peek for follow-up bytes after reading `\e` so we can
@@ -1327,7 +1354,8 @@ dispatch_subcommand() {
 
     theme)
       # `theme [dark|light|neon|next]` — show or set the persistent
-      # theme. Settings file lives at ~/.config/gh-runner-status/settings.
+      # theme. Settings file lives at $XDG_CONFIG_HOME/gh-runner-status/
+      # settings (defaults to ~/.config/gh-runner-status/settings).
       if [[ ${#positional[@]} -eq 0 ]]; then
         echo "current: ${GH_RUNNER_STATUS_THEME:-dark}"
         echo "available: dark, light, neon"
@@ -1349,7 +1377,10 @@ dispatch_subcommand() {
           echo "error: theme must be one of: dark, light, neon, next" >&2
           return 2 ;;
       esac
-      _save_setting theme "$target"
+      if ! _save_setting theme "$target"; then
+        echo "error: failed to write settings file at $(_settings_path)" >&2
+        return 1
+      fi
       echo "theme set to: $target"
       echo "(takes effect on next \`gh runner-status\` invocation)"
       ;;
@@ -2422,13 +2453,13 @@ dashboard_loop() {
     rc=$?
     local read_elapsed=$(( SECONDS - read_started ))
 
-    # rc=1 from `read -t` covers BOTH user-pressed-Ctrl-D AND any
-    # stdin glitch (closed pipe, terminal multiplexer reopening fd 0,
-    # etc.). Differentiate by elapsed time: a real Ctrl-D press
-    # arrives quickly, but so does an EOF — so the discriminator is
-    # whether multiple EOFs happen back-to-back without any actual
-    # user interaction. We require a "settling period" between Ctrl-D
-    # presses to count them as confirmation.
+    # `read -t` returns rc=1 on EOF/closed stdin. That can happen
+    # for many reasons besides a deliberate Ctrl-D press (terminal
+    # multiplexer reattaching, gh wrapper closing fd 0, etc.), so we
+    # don't tie it to the destructive quit action — too many false
+    # positives, including a deterministic ~60s exit in some shells.
+    # Show a one-time hint and ignore. `q` and Esc are the reliable
+    # quit paths.
     if [[ $rc -eq 1 ]]; then
       dlog "read rc=1 (EOF) elapsed=${read_elapsed}s — ignoring (use q or Esc to quit)"
       # bash `read -t` returns rc=1 on EOF, but EOF can come from
