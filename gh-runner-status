@@ -17,6 +17,30 @@ set -euo pipefail
 
 VERSION="0.3.5" # x-release-please-version
 
+# Bash 4+ supports fractional `read -t` timeouts and a few other
+# niceties (mapfile, namerefs, `${var^^}`). macOS still ships /bin/bash
+# 3.2 by default — Apple froze it pre-GPLv3. Capture once so the rest
+# of the script can branch cheaply without re-checking BASH_VERSINFO.
+if (( ${BASH_VERSINFO[0]:-0} >= 4 )); then
+  BASH_HAS_FRACTIONAL_TIMEOUT=1
+else
+  BASH_HAS_FRACTIONAL_TIMEOUT=0
+fi
+
+# Read up to 2 bytes with a short timeout into the named variable.
+# Used to peek for follow-up bytes after reading `\e` so we can
+# distinguish lone Esc from escape-sequence prefixes (arrow keys, etc.).
+# Cross-version: 50ms on bash 4+, non-blocking peek on bash 3.2.
+_read_short_peek() {
+  local __varname="$1"
+  # shellcheck disable=SC2229 # intentional indirection: bash `read` reads into the variable named by $__varname
+  if [[ "$BASH_HAS_FRACTIONAL_TIMEOUT" == "1" ]]; then
+    read -rsn 2 -t 0.05 "$__varname" 2>/dev/null  # bash4-ok: gated by BASH_HAS_FRACTIONAL_TIMEOUT
+  else
+    read -rsn 2 -t 0 "$__varname" 2>/dev/null
+  fi
+}
+
 tmpdir=""
 trap 'rm -rf "${tmpdir:-}"' EXIT
 
@@ -2283,11 +2307,19 @@ dashboard_loop() {
 
     local age=$(( SECONDS - DASHBOARD_CACHE_AT ))
     local remaining=$(( refresh - age ))
-    local read_timeout="$remaining"
-    (( remaining <= 0 )) && read_timeout="0.01"
+
+    # If we're at or past the refresh interval, refresh immediately
+    # without reading. Avoids `read -t 0.01` which works on bash 4+
+    # but errors on macOS bash 3.2 ("invalid timeout specification" —
+    # that bash only accepts integer timeouts).
+    if (( remaining <= 0 )); then
+      _dashboard_refresh_cache
+      quit_pending_at=0; quit_pending_reason=""
+      continue
+    fi
 
     local key="" rc=0
-    read -rsn 1 -t "$read_timeout" key
+    read -rsn 1 -t "$remaining" key
     rc=$?
 
     if [[ $rc -eq 1 ]]; then
@@ -2304,14 +2336,15 @@ dashboard_loop() {
     case "$key" in
       q|Q) DASHBOARD_QUIT=1 ;;
       $'\e')
-        # `\e` is both lone Esc AND the first byte of escape sequences
-        # (arrow keys, function keys). Distinguish by trying to read 2
-        # more bytes with a 50ms timeout — arrow keys have those bytes
-        # already buffered; lone Esc has nothing following.
+        # `\e` is both lone Esc AND the first byte of escape sequences.
+        # Distinguish by reading follow-up bytes — bash 4+ can use a
+        # 50ms fractional timeout, bash 3.2 falls back to a non-blocking
+        # peek (arrow-key follow-up bytes are already buffered when
+        # we get here, so this works either way).
         local _rest=""
-        if read -rsn 2 -t 0.05 _rest 2>/dev/null && [[ -n "$_rest" ]]; then
-          # Escape sequence (arrow key, etc.). Treat as "any other key"
-          # so it cancels a pending quit, matching the UI hint.
+        _read_short_peek _rest || true
+        if [[ -n "$_rest" ]]; then
+          # Escape sequence — cancel any pending quit and ignore.
           quit_pending_at=0; quit_pending_reason=""
         else
           if [[ "$quit_pending_reason" == "Esc" ]]; then
