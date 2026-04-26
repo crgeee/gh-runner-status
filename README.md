@@ -23,20 +23,39 @@ Then:
 
 ```bash
 gh runner-status owner/repo                         # status of one repo
-gh runner-status                                    # interactive REPL (in a terminal)
+gh runner-status                                    # live dashboard (in a terminal)
 ```
 
 That's it.
+
+**Upgrades are free** (it's just pulling the latest from GitHub):
+
+```bash
+gh extension upgrade gh-runner-status
+```
+
+The extension itself is **free and open source** (MIT license) — no subscription, no API key beyond your existing `gh auth`, no telemetry.
+
+**Uninstall:**
+
+```bash
+gh extension remove gh-runner-status
+```
+
+This removes the extension binary and shim. Your `~/.config/gh-runner-status/` config (`repos`, `telegram` if you set it up) is left in place so a re-install picks up where you left off.
 
 > **Linux?** Replace `brew install gh jq` with `sudo apt-get install -y gh jq` (Debian/Ubuntu), `sudo dnf install -y gh jq` (Fedora), or `sudo pacman -S github-cli jq` (Arch). For Telegram alerts you also need `curl` (almost certainly already installed).
 
 ## What it does
 
-- **`list`** — one table for runners across every repo you care about
+- **`list`** — one table across every repo, with **per-runner CPU/MEM** for runners installed on this machine
+- **`stats`** — fleet-wide aggregate view (online/offline/busy counts, top labels, OS distribution, total resource usage)
+- **`local`** — runners installed on this machine, with PID / uptime / CPU / MEM / active-jobs columns
 - **`start` / `stop` / `restart` / `logs`** — control runners on the local machine
+- **`add` / `remove`** — register a new runner against a repo, or deregister one
 - **`watch`** — auto-refresh table on an interval
 - **`notify`** — Telegram alert when something goes offline (cron-friendly)
-- **REPL** — bare `gh runner-status` opens a Claude-Code-style prompt with slash commands
+- **Live dashboard** — bare `gh runner-status` opens an auto-refreshing TUI with single-key controls
 
 GitHub's UI makes you click into each repo's Settings → Actions → Runners page one at a time. This bundles them into one view and adds local control + alerting.
 
@@ -103,21 +122,60 @@ Command-mode aliases: `l`/`ls` → `list`, `r` → `restart`, `s` → `start`, `
 
 Custom interval: `gh runner-status watch 5` opens the same dashboard refreshing every 5 seconds. The default `gh runner-status` is 30s.
 
-## Local runner metrics
+## Per-runner metrics
 
-`gh runner-status local` now shows running PIDs, process uptime, CPU%, and resident memory for every runner installed on the current machine — so you can see at a glance which agents are alive and how much they're using:
+The main `list` table includes **CPU and MEM columns automatically** for runners installed on this machine — totals are summed across the whole agent process tree (`runsvc.sh` wrapper + `Runner.Listener` + any active worker), so the numbers reflect real usage:
+
+```
+$ gh runner-status
+
+  REPO                  NAME            STATUS  BUSY  CPU   MEM   LABELS
+-------------------------------------------------------------------------------
+✓ acme-corp/api         runner-1        online  no    0.0%  53M   self-hosted,linux,x64
+✓ acme-corp/api         runner-2        online  yes   42.1% 187M  self-hosted,linux,x64
+✗ acme-corp/web         runner-1        offline no    -     -     self-hosted,linux,x64
+```
+
+Remote runners (not on this machine) show `-` for CPU/MEM since we can't observe their processes.
+
+`gh runner-status local` shows the same data with extra columns (PID, UPTIME, JOBS) for runners installed locally:
 
 ```
 $ gh runner-status local
 
-  NAME                                              PID    UPTIME   CPU   MEM
--------------------------------------------------------------------------------
-✓ actions.runner.acme-api.runner-1                  1234   2d 4h    0.0%  45M
-✓ actions.runner.acme-web.runner-1                  1235   2d 4h    0.0%  43M
-✗ actions.runner.acme-data.runner-1                 -      -        -     -
+  NAME                                              PID    UPTIME   CPU   MEM   JOBS
+-------------------------------------------------------------------------------------
+✓ actions.runner.acme-api.runner-1                  1234   2d 4h    0.0%  53M   0
+✓ actions.runner.acme-api.runner-2                  1235   2d 4h    42.1% 187M  1
+✗ actions.runner.acme-data.runner-1                 -      -        -     -     -
 ```
 
-`--json` output includes the same metrics for scripting.
+`JOBS` is the count of process-tree descendants beyond the agent baseline (`bash` + `node` + `Runner.Listener` = 3) — i.e. the number of `Runner.Worker` processes actively executing jobs. `--json` includes all metrics for scripting.
+
+## Fleet stats
+
+```
+$ gh runner-status stats
+
+▸ Fleet stats (2 repos)
+
+  Total runners      5
+  Online / Offline   5 / 0
+  Busy / Idle        1 / 4
+  Local (this host)  5 (312M combined memory, 42.1% CPU)
+
+Top labels:
+  5x self-hosted
+  5x linux
+  5x x64
+  1x gpu
+
+By OS:
+  4x linux
+  1x macOS
+```
+
+Quick aggregate view across the whole fleet — no per-runner clutter. `--json` returns the same data structured.
 
 ## Add or remove a runner
 

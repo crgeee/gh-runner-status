@@ -48,6 +48,21 @@ jobs:
       - name: Run bats suite
         run: bats tests/
 
+      # macOS still ships /bin/bash 3.2 (frozen at GPLv2). Anyone who
+      # installs this extension on a stock Mac without `brew install bash`
+      # runs it under 3.2. Re-run the suite explicitly under that bash so
+      # we catch bashisms (read -e -i, mapfile, namerefs, ${var^^}, etc.)
+      # — shellcheck doesn't have version-specific lint.
+      - name: Run bats under macOS system bash 3.2
+        if: runner.os == 'macOS'
+        run: |
+          /bin/bash --version | head -1
+          # Prepend /bin to PATH so the script's `#!/usr/bin/env bash`
+          # shebang resolves to /bin/bash (3.2) instead of brew bash 5.x.
+          # brew gh/jq stay reachable further down the PATH so the
+          # script's `require gh` / `require jq` checks still pass.
+          PATH="/bin:$PATH" bats tests/
+
   coverage:
     name: Coverage (kcov)
     runs-on: ubuntu-latest
