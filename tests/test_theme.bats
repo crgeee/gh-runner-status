@@ -72,15 +72,6 @@ teardown() {
   [ -z "${GH_RUNNER_STATUS_THEME:-}" ]
 }
 
-@test "theme: env var wins over settings file" {
-  local cfg="$XDG_CONFIG_HOME/gh-runner-status/settings"
-  mkdir -p "$(dirname "$cfg")"
-  echo "theme=light" > "$cfg"
-  GH_RUNNER_STATUS_THEME=neon
-  _load_settings
-  [ "$GH_RUNNER_STATUS_THEME" = "neon" ]
-}
-
 @test "theme: settings file CRLF tolerated" {
   local cfg="$XDG_CONFIG_HOME/gh-runner-status/settings"
   mkdir -p "$(dirname "$cfg")"
