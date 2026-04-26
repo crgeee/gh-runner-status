@@ -263,9 +263,40 @@ A bad repo doesn't crash the run — its row appears with the error inline.
 
 ## Local runner control
 
+Use the **short name** you see in the table — no need to type the full LaunchAgent label:
+
+```bash
+gh runner-status start   runner-1     # short name auto-resolved
+gh runner-status restart runner-1
+gh runner-status stop    runner-1
+gh runner-status logs    runner-1
+```
+
+If a short name is ambiguous (two repos both have a `runner-1`), the command lists the matches and asks you to use the full label. Full labels still work too.
+
 `start`/`stop`/`restart`/`logs` target:
 - **macOS** — LaunchAgents at `~/Library/LaunchAgents/actions.runner.*.plist` (the path GitHub's installer uses)
 - **Linux** — `systemd` user services or system services named `actions.runner.*.service`
+
+## Shell autocomplete
+
+```bash
+echo 'source ~/.local/share/gh/extensions/gh-runner-status/completions/gh-runner-status.bash' >> ~/.bashrc
+```
+
+After sourcing, tab-completion works for both:
+
+- `gh-runner-status <TAB>` (the binary, useful if `~/.local/share/gh/extensions/gh-runner-status` is on your PATH)
+- `gh runner-status <TAB>` (gh-extension form — the script registers a small wrapper on `gh` that delegates only when the first arg is `runner-status`)
+
+Completions provided:
+- subcommands (`list local start stop ...`)
+- runner short names for `start/stop/restart/logs` (reads installed LaunchAgents/systemd units, both user and system on Linux)
+- configured repos for `list/add/remove`
+
+Pure bash, compatible with bash 3.2 (macOS default).
+
+> Note: if you have GitHub's official `gh` shell completion installed, our `complete -F` registration replaces it. If you need both, source gh's own completion *after* this one — bash chains `complete` registrations in last-write-wins order.
 
 ## Security
 

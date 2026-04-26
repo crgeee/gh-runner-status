@@ -594,9 +594,66 @@ list_local_runners() {
   esac
 }
 
+# Accept a short runner name (e.g. `runner-1`) or a full LaunchAgent
+# label (e.g. `actions.runner.acme-api.runner-1`) and resolve to the
+# canonical full label by matching against installed runners. Useful
+# because users see the short name in the table and would rather not
+# type the full namespace just to control a runner.
+#
+# Errors with disambiguation help when the short name is ambiguous.
+_resolve_runner_label() {
+  local input="$1"
+  # Already a full label?
+  if [[ "$input" == actions.runner.* ]]; then
+    echo "$input"
+    return 0
+  fi
+  # Capture both stdout AND exit code so we surface OS-unsupported as
+  # a real error instead of a misleading "no runner matching".
+  local raw rc
+  raw=$(list_local_runners 2>&1)
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "$raw" >&2
+    return $rc
+  fi
+  local matches
+  matches=$(echo "$raw" | awk -v n="$input" '
+    BEGIN { count = 0 }
+    {
+      # short name = everything after the last dot in the label
+      n_idx = match($0, /[^.]+$/)
+      short = substr($0, n_idx)
+      if (short == n) { found[count++] = $0 }
+    }
+    END {
+      for (i = 0; i < count; i++) print found[i]
+    }
+  ')
+
+  local match_count
+  match_count=$(printf '%s' "$matches" | awk 'NF{c++} END{print c+0}')
+  if [[ "$match_count" -eq 0 ]]; then
+    echo "error: no local runner matching '$input' (try \`local\` to list)" >&2
+    return 1
+  elif [[ "$match_count" -gt 1 ]]; then
+    {
+      echo "error: '$input' is ambiguous — multiple matches:"
+      while IFS= read -r m; do
+        [[ -n "$m" ]] && echo "  $m"
+      done <<<"$matches"
+      echo "use the full label or distinguish by repo."
+    } >&2
+    return 1
+  fi
+  printf '%s' "$matches" | head -n 1
+}
+
 local_runner_action() {
-  local action="$1" name="$2"
-  validate_runner_name "$name"
+  local action="$1" input="$2"
+  local name
+  name=$(_resolve_runner_label "$input") || return 1
+  validate_runner_name "$name" || return 1
   local os
   os=$(detect_os)
   case "$os" in
@@ -645,8 +702,10 @@ local_runner_action() {
 }
 
 local_runner_logs() {
-  local name="$1"
-  validate_runner_name "$name"
+  local input="$1"
+  local name
+  name=$(_resolve_runner_label "$input") || return 1
+  validate_runner_name "$name" || return 1
   local os
   os=$(detect_os)
   case "$os" in
@@ -1269,24 +1328,65 @@ render_repl_footer() {
 # Render the active dashboard: banner, status table, footer. Used on
 # REPL entry and on /clear so the user always has live state visible
 # rather than a blank prompt.
+# Pull the current rows once and stash them in DASHBOARD_ROWS_CACHE,
+# along with DASHBOARD_CACHE_STATUS so the renderer can distinguish:
+#   ok           — rows ready to display (may be empty if no runners)
+#   no_config    — config file missing or empty
+#   fetch_error  — fetch attempted but failed (bad token, network down)
+# Called by the dashboard loop on first paint, on timer expiry, and on
+# explicit [r]efresh. Post-command redraws use the cache (no API call)
+# so they're instant.
+_dashboard_refresh_cache() {
+  local cfg="${CONFIG_FILE:-$(config_path)}"
+  DASHBOARD_CACHE_AT=$SECONDS
+  if [[ ! -f "$cfg" || ! -s "$cfg" ]]; then
+    DASHBOARD_ROWS_CACHE=""
+    DASHBOARD_CACHE_STATUS="no_config"
+    return 0
+  fi
+  local repos=()
+  while IFS= read -r r; do
+    [[ -n "$r" ]] && repos+=("$r")
+  done < <(read_config_optional "$cfg")
+  if [[ ${#repos[@]} -eq 0 ]]; then
+    DASHBOARD_ROWS_CACHE=""
+    DASHBOARD_CACHE_STATUS="no_config"
+    return 0
+  fi
+  if DASHBOARD_ROWS_CACHE=$(collect_remote_runners "${repos[@]}" 2>&1); then
+    DASHBOARD_CACHE_STATUS="ok"
+  else
+    DASHBOARD_ROWS_CACHE=""
+    DASHBOARD_CACHE_STATUS="fetch_error"
+  fi
+}
+
 render_dashboard() {
   local has_color="$1"
   local refresh="${2:-30}"
   if [[ $has_color -eq 1 ]]; then
-    # Use the alternate screen? No — that hides scrollback. Just clear.
     printf '\033[H\033[2J' 2>/dev/null || true
   fi
   render_repl_banner "$has_color"
   echo
 
-  local cfg="${CONFIG_FILE:-$(config_path)}"
-  if [[ -f "$cfg" ]] && [[ -s "$cfg" ]]; then
-    if ! dispatch_subcommand list 2>&1; then
-      # shellcheck disable=SC2016 # backticks here are intentional literal text in the user-facing hint
-      printf '\n\033[33m(could not fetch runner status — check `gh auth status` and try `list`)\033[0m\n'
-    fi
-  else
-    cat <<EOF
+  case "${DASHBOARD_CACHE_STATUS:-no_config}" in
+    ok)
+      render_table "$DASHBOARD_ROWS_CACHE"
+      local age=$(( SECONDS - ${DASHBOARD_CACHE_AT:-$SECONDS} ))
+      if [[ $has_color -eq 1 && $age -gt 0 ]]; then
+        local until=$(( refresh - age ))
+        (( until < 0 )) && until=0
+        printf '\033[2m  (data %ds old; auto-refresh in %ds, [r] to force)\033[0m\n' "$age" "$until"
+      fi
+      ;;
+    fetch_error)
+      # shellcheck disable=SC2016 # backticks intentional in the hint
+      printf '\033[33m(could not fetch runner status — check `gh auth status` and try [r])\033[0m\n'
+      ;;
+    no_config|*)
+      local cfg="${CONFIG_FILE:-$(config_path)}"
+      cat <<EOF
 no fleet configured yet. add one repo per line to:
   $cfg
 
@@ -1294,7 +1394,8 @@ press [a] to add a repo, or:
   mkdir -p $(dirname "$cfg")
   printf 'acme-corp/api\nacme-corp/web\n' > $cfg
 EOF
-  fi
+      ;;
+  esac
   echo
   render_repl_footer "$has_color" "$refresh"
 }
@@ -1411,39 +1512,56 @@ dashboard_loop() {
   local has_color=0
   [[ -t 1 ]] && has_color=1
   DASHBOARD_QUIT=0
+  DASHBOARD_ROWS_CACHE=""
+  DASHBOARD_CACHE_AT=0
 
   # Ctrl-C exits gracefully (default would kill the script with 130 and
   # leave the terminal in a weird state).
   trap 'echo; DASHBOARD_QUIT=1' INT
 
+  # Initial fetch so the first paint has data.
+  _dashboard_refresh_cache
+
   while [[ $DASHBOARD_QUIT -eq 0 ]]; do
+    # Cache-driven render — no API call here. Only timer-fires and [r]
+    # invoke _dashboard_refresh_cache, so post-command redraws are
+    # instant and don't re-hit the API.
     render_dashboard "$has_color" "$refresh"
 
+    # Time-to-next-refresh = refresh - age. When that's <=0, refresh
+    # immediately (use a fractional 0.01s timeout — `read -t 0` returns
+    # immediately regardless of input availability, which is what we
+    # want for steady-state on-interval refreshing without a 1s drift).
+    local age=$(( SECONDS - DASHBOARD_CACHE_AT ))
+    local remaining=$(( refresh - age ))
+    local read_timeout="$remaining"
+    (( remaining <= 0 )) && read_timeout="0.01"
+
     local key="" rc=0
-    # Silent, single-char read with a timeout. Timeout → redraw with
-    # fresh data. Keypress → handle. EOF (Ctrl-D, closed stdin) returns
-    # non-zero with empty key — distinguish from a timeout via $rc.
-    read -rsn 1 -t "$refresh" key
+    read -rsn 1 -t "$read_timeout" key
     rc=$?
 
-    # rc=0: got a key. rc=142 (timeout). rc=1+: EOF/error.
-    if [[ $rc -gt 1 ]]; then
+    # rc=0: keypress. rc=142 (or anything 128+): timeout. rc=1: EOF/error.
+    if [[ $rc -eq 1 ]]; then
       DASHBOARD_QUIT=1
       continue
     fi
 
     case "$key" in
       q|Q) DASHBOARD_QUIT=1 ;;
-      r|R) ;; # fall through, loop redraws
+      r|R) _dashboard_refresh_cache ;;             # explicit refresh
       h|H|"?")
         repl_help
         _pause_for_keypress "$has_color"
         ;;
-      c|C) prompt_and_run "$has_color" ;;
-      /)   prompt_and_run "$has_color" "/" ;;     # locked-in slash prefix
-      a|A) prompt_and_run "$has_color" "add " ;;  # locked-in add prefix
-      "")  ;; # timeout, just redraw
-      *)   ;; # ignore other keys
+      c|C) prompt_and_run "$has_color" ;;          # cache stays warm
+      /)   prompt_and_run "$has_color" "/" ;;
+      a|A) prompt_and_run "$has_color" "add " ;;
+      "")
+        # Timeout — refresh cache so the next render shows fresh data.
+        _dashboard_refresh_cache
+        ;;
+      *) ;; # ignore other keys
     esac
   done
 
