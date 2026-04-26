@@ -569,11 +569,18 @@ local_runner_version() {
     | tail -1
 }
 
-# Latest Actions Runner release. Cached for an hour so the dashboard
-# doesn't hit the API every refresh. Cache lives under XDG_CACHE_HOME
-# (or ~/.cache) — more durable than $TMPDIR and harder to clobber via
-# symlink races in a shared $TMPDIR. Writes go to a temp file and are
-# atomically renamed so concurrent processes never see a partial read.
+# Latest Actions Runner release. GitHub publishes new runner releases
+# roughly every 1-3 months, so a 12-hour cache is plenty fresh while
+# saving ~720 API calls per day per dashboard. Cache lives under
+# XDG_CACHE_HOME so it persists across script invocations and survives
+# /tmp clears. Writes are atomic (temp + rename).
+LATEST_VERSION_TTL_SECONDS="${LATEST_VERSION_TTL_SECONDS:-43200}"  # 12h
+# Validate: arithmetic comparison under set -e would crash the whole
+# script on a non-integer override. Fall back to the 12h default.
+if [[ ! "$LATEST_VERSION_TTL_SECONDS" =~ ^[0-9]+$ ]]; then
+  LATEST_VERSION_TTL_SECONDS=43200
+fi
+
 _latest_version_cache_path() {
   local base="${XDG_CACHE_HOME:-$HOME/.cache}/gh-runner-status"
   mkdir -p "$base" 2>/dev/null || true
@@ -588,7 +595,7 @@ latest_runner_version() {
     mtime=$(stat -f %m "$cache" 2>/dev/null || stat -c %Y "$cache" 2>/dev/null || echo 0)
     now=$(date +%s)
     age=$(( now - mtime ))
-    if (( age < 3600 )); then
+    if (( age < LATEST_VERSION_TTL_SECONDS )); then
       cat "$cache"
       return 0
     fi
@@ -1217,6 +1224,195 @@ dispatch_subcommand() {
       jq -r '.oses[] | "  \(.count)x \(.os)"' <<<"$agg"
       ;;
 
+    setup)
+      # `setup OWNER/REPO [--name NAME] [--labels L1,L2] [--dir PATH]`
+      # Zero-to-running runner installation. Mints token, downloads
+      # tarball, extracts, configures, installs service with KeepAlive
+      # patched in for crash recovery, starts it, verifies online.
+      local repo="" runner_name="" labels="self-hosted" install_root="" yes=0
+      local saw_repo=0
+      # Copy the positional array without re-splitting so values
+      # containing spaces (e.g. `--dir "/path with spaces"`) are
+      # preserved as single elements.
+      local _args=()
+      if [[ ${#positional[@]} -gt 0 ]]; then
+        _args=("${positional[@]}")
+      fi
+      local i=0 n=${#_args[@]}
+      while (( i < n )); do
+        local a="${_args[i]}"
+        case "$a" in
+          --name)
+            i=$((i+1)); [[ $i -ge $n ]] && { echo "error: --name requires a value" >&2; return 2; }
+            runner_name="${_args[i]}"; i=$((i+1)) ;;
+          --labels)
+            i=$((i+1)); [[ $i -ge $n ]] && { echo "error: --labels requires a value" >&2; return 2; }
+            labels="${_args[i]}"; i=$((i+1)) ;;
+          --dir)
+            i=$((i+1)); [[ $i -ge $n ]] && { echo "error: --dir requires a value" >&2; return 2; }
+            install_root="${_args[i]}"; i=$((i+1)) ;;
+          --yes|-y) yes=1; i=$((i+1)) ;;
+          --*)
+            echo "error: unknown flag '$a' for setup" >&2
+            echo "usage: setup OWNER/REPO [--name NAME] [--labels L1,L2] [--dir PATH] [-y]" >&2
+            return 2 ;;
+          *)
+            if [[ $saw_repo -eq 1 ]]; then
+              echo "error: setup accepts one OWNER/REPO (got extra: '$a')" >&2; return 2
+            fi
+            repo="$a"; saw_repo=1; i=$((i+1)) ;;
+        esac
+      done
+
+      if [[ -z "$repo" ]]; then
+        echo "error: setup requires OWNER/REPO" >&2
+        echo "usage: setup OWNER/REPO [--name NAME] [--labels L1,L2] [--dir PATH] [-y]" >&2
+        return 2
+      fi
+      validate_repo "$repo" || return 2
+
+      [[ -z "$runner_name" ]] && runner_name=$(hostname -s 2>/dev/null || echo "runner-$$")
+      validate_runner_name "actions.runner.${repo//\//-}.${runner_name}" || return 2
+      [[ -z "$install_root" ]] && install_root="$HOME/.gh-runners/${repo//\//-}-${runner_name}"
+
+      local os arch
+      case "$(uname -s)" in
+        Darwin) os="osx" ;;
+        Linux)  os="linux" ;;
+        *) echo "error: setup not supported on $(uname -s)" >&2; return 1 ;;
+      esac
+      case "$(uname -m)" in
+        arm64|aarch64) arch="arm64" ;;
+        x86_64)        arch="x64" ;;
+        *) echo "error: setup not supported on $(uname -m)" >&2; return 1 ;;
+      esac
+
+      local latest
+      latest=$(latest_runner_version)
+      if [[ -z "$latest" ]]; then
+        echo "error: could not determine latest runner version" >&2
+        return 1
+      fi
+
+      cat <<EOF
+Setting up self-hosted runner:
+  Repo:         $repo
+  Runner name:  $runner_name
+  Labels:       $labels
+  Install dir:  $install_root
+  Version:      $latest
+  Platform:     $os/$arch
+EOF
+      if [[ $yes -ne 1 && -t 0 ]]; then
+        printf "Continue? [y/N] "
+        local ans; read -r ans
+        [[ "$ans" =~ ^[Yy] ]] || { echo "Aborted."; return 1; }
+      fi
+
+      local token_resp token
+      if ! token_resp=$(gh api "repos/${repo}/actions/runners/registration-token" -X POST 2>&1); then
+        echo "error: could not mint registration token: $token_resp" >&2; return 1
+      fi
+      token=$(jq -r '.token' <<<"$token_resp")
+      [[ -z "$token" || "$token" == "null" ]] && { echo "error: empty token" >&2; return 1; }
+
+      mkdir -p "$install_root" || { echo "error: could not create $install_root" >&2; return 1; }
+      cd "$install_root" || return 1
+
+      local tarname="actions-runner-${os}-${arch}-${latest}.tar.gz"
+      local url="https://github.com/actions/runner/releases/download/v${latest}/${tarname}"
+
+      echo "Downloading $tarname..."
+      if ! curl -fsSL "$url" -o "$tarname"; then
+        echo "error: download failed" >&2; return 1
+      fi
+
+      echo "Extracting..."
+      if ! tar -xzf "$tarname"; then
+        echo "error: extraction failed" >&2; return 1
+      fi
+      rm -f "$tarname"
+
+      echo "Configuring..."
+      if ! ./config.sh \
+          --url "https://github.com/${repo}" \
+          --token "$token" \
+          --name "$runner_name" \
+          --labels "$labels" \
+          --work _work \
+          --unattended --replace; then
+        echo "error: config.sh failed" >&2; return 1
+      fi
+
+      echo "Installing as service..."
+      if ! ./svc.sh install; then
+        echo "error: svc.sh install failed" >&2; return 1
+      fi
+
+      # Patch KeepAlive into the LaunchAgent so a crashed runner gets
+      # restarted by launchd. GitHub's installer omits this; with it
+      # off, a single Runner.Listener crash leaves you offline until
+      # next manual `start`.
+      local label="actions.runner.${repo//\//-}.${runner_name}"
+      if [[ "$os" == "osx" ]]; then
+        local plist="$HOME/Library/LaunchAgents/${label}.plist"
+        if [[ -f "$plist" ]] && ! grep -q '<key>KeepAlive</key>' "$plist"; then
+          echo "Adding KeepAlive to LaunchAgent for crash recovery..."
+          # Insert <key>KeepAlive</key><true/> right before </dict>.
+          # Make the temp file in the SAME directory as the plist so
+          # the subsequent mv is a real atomic rename (would otherwise
+          # be a copy+delete across filesystems and could leave a
+          # partial write visible to launchd).
+          local tmp
+          tmp=$(mktemp "${plist}.XXXXXX") || tmp=""
+          if [[ -n "$tmp" ]]; then
+            if awk '/^[[:space:]]*<\/dict>$/ && !done { print "    <key>KeepAlive</key>"; print "    <true/>"; done=1 } { print }' \
+                 "$plist" >"$tmp"; then
+              mv -f "$tmp" "$plist"
+            else
+              rm -f "$tmp"
+            fi
+          fi
+          # Reload service so the change takes effect.
+          ./svc.sh stop 2>/dev/null || true
+        fi
+      fi
+
+      echo "Starting..."
+      if ! ./svc.sh start; then
+        echo "error: svc.sh start failed" >&2; return 1
+      fi
+
+      cd - >/dev/null
+
+      # Add repo to local config.
+      local cfg_file="${CONFIG_FILE:-$(config_path)}"
+      mkdir -p "$(dirname "$cfg_file")"
+      if [[ ! -f "$cfg_file" ]] || ! grep -qxF "$repo" "$cfg_file"; then
+        echo "$repo" >> "$cfg_file"
+        echo "Added $repo to $cfg_file"
+      fi
+
+      # Verify online via the API (poll up to 30s).
+      echo "Verifying with GitHub..."
+      local _i
+      for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        local check_resp status_field
+        check_resp=$(gh api "repos/${repo}/actions/runners" --paginate 2>/dev/null || echo "{}")
+        status_field=$(jq -r --arg n "$runner_name" '.runners[]? | select(.name == $n) | .status' <<<"$check_resp")
+        if [[ "$status_field" == "online" ]]; then
+          echo "✓ Runner '$runner_name' is online and registered against $repo."
+          return 0
+        fi
+        sleep 2
+      done
+
+      echo "⚠ Runner installed and started but did not appear online within 30s."
+      echo "  Check: gh runner-status doctor"
+      echo "         gh runner-status logs $runner_name"
+      return 0
+      ;;
+
     info)
       # `info NAME` — detailed view of one runner. Combines API data
       # (status, busy, labels) with local introspection (PID, uptime,
@@ -1416,7 +1612,9 @@ dispatch_subcommand() {
       ;;
 
     doctor)
-      # Health check for the local fleet.
+      # Health check for the local fleet AND host-level reboot/sleep
+      # resilience. Catches the "did the machine reboot and now nothing
+      # auto-started?" class of problems before they bite.
       local issues=0
       local raw rc
       raw=$(list_local_runners 2>&1)
@@ -1426,6 +1624,8 @@ dispatch_subcommand() {
       latest=$(latest_runner_version)
       echo "Health check (latest runner version: ${latest:-?})"
       echo
+
+      # ── Per-runner checks ───────────────────────────────────────
       while IFS= read -r r; do
         [[ -z "$r" ]] && continue
         local pid version v_status install_dir
@@ -1439,6 +1639,15 @@ dispatch_subcommand() {
         [[ -z "$install_dir" ]] && row_issues+=("install dir not found")
         [[ "$v_status" == "outdated" ]] && row_issues+=("outdated ($version, latest $latest)")
 
+        # KeepAlive check — without it, a crashed Runner.Listener
+        # stays dead until manual intervention. macOS-specific.
+        if [[ "$(detect_os)" == "macos" ]]; then
+          local plist="$HOME/Library/LaunchAgents/${r}.plist"
+          if [[ -f "$plist" ]] && ! grep -q '<key>KeepAlive</key>' "$plist"; then
+            row_issues+=("LaunchAgent missing KeepAlive — runner won't auto-restart on crash")
+          fi
+        fi
+
         if [[ ${#row_issues[@]} -eq 0 ]]; then
           printf '  ✓ %s\n' "$r"
         else
@@ -1449,14 +1658,65 @@ dispatch_subcommand() {
           done
         fi
       done <<<"$raw"
+
+      # ── Host-level resilience ──────────────────────────────────
+      echo
+      echo "Host resilience:"
+      if [[ "$(detect_os)" == "macos" ]]; then
+        # macOS LaunchAgents only fire on user login. Without auto-login
+        # enabled, a headless reboot leaves every runner offline until
+        # someone physically logs in.
+        local autologin
+        autologin=$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null || echo "")
+        if [[ -z "$autologin" ]]; then
+          printf '  ✗ auto-login not enabled — runners will NOT auto-start after reboot\n'
+          printf '      fix: System Settings → Users & Groups → Login Options → Automatic login\n'
+          issues=$(( issues + 1 ))
+        else
+          printf '  ✓ auto-login enabled for user %s (survives reboot)\n' "$autologin"
+        fi
+
+        # pmset sleep — if the mac sleeps, all runners stop responding.
+        local sleep_min
+        sleep_min=$(pmset -g 2>/dev/null | awk '/^[[:space:]]*sleep[[:space:]]/ {print $2}')
+        if [[ -n "$sleep_min" && "$sleep_min" != "0" ]]; then
+          printf '  ✗ system sleep is %s min — runners will go offline when the mac sleeps\n' "$sleep_min"
+          printf '      fix: sudo pmset -a sleep 0\n'
+          issues=$(( issues + 1 ))
+        else
+          printf '  ✓ system sleep disabled (sleep=0)\n'
+        fi
+      elif [[ "$(detect_os)" == "linux" ]]; then
+        # systemd Restart= matters the same way KeepAlive does on
+        # macOS — without it, a crashed runner stays down. systemctl
+        # show doesn't expand globs, so we have to enumerate units
+        # first and check each one.
+        local units unit r
+        units=$( {
+          systemctl --user list-units --type=service --all --no-legend 'actions.runner.*' 2>/dev/null || true
+          systemctl list-units --type=service --all --no-legend 'actions.runner.*' 2>/dev/null || true
+        } | awk '{print $1}' | sort -u )
+        while IFS= read -r unit; do
+          [[ -z "$unit" ]] && continue
+          r=$(systemctl --user show -P Restart "$unit" 2>/dev/null \
+              || systemctl show -P Restart "$unit" 2>/dev/null || true)
+          if [[ -z "$r" || "$r" == "no" ]]; then
+            printf '  ⚠ %s has Restart=%s — crashes will not auto-recover\n' "$unit" "${r:-no}"
+            printf '      fix: edit the unit and add Restart=always (or on-failure)\n'
+            issues=$(( issues + 1 ))
+          fi
+        done <<<"$units"
+      fi
+
       echo
       if [[ $issues -eq 0 ]]; then
-        echo "All runners healthy."
+        echo "All checks passed. Fleet is healthy and resilient."
         return 0
       else
-        echo "$issues issue(s) found across the fleet."
+        echo "$issues issue(s) found."
         echo "Tip: gh runner-status update [<name>]   to upgrade outdated runners"
         echo "     gh runner-status start <name>     to start stopped runners"
+        echo "     gh runner-status setup OWNER/REPO to install a new runner"
         return 1
       fi
       ;;
@@ -1837,7 +2097,7 @@ handle_repl_line() {
         a)    words[0]="add" ;;
       esac
       case "${words[0]}" in
-        list|status|local|start|stop|restart|logs|notify|watch|add|remove|stats|update|doctor|info)
+        list|status|local|start|stop|restart|logs|notify|watch|add|remove|stats|update|doctor|info|setup)
           dispatch_subcommand "${words[@]}" || true
           ;;
         *)
@@ -1851,12 +2111,18 @@ handle_repl_line() {
 _pause_for_keypress() {
   local has_color="$1"
   if [[ $has_color -eq 1 ]]; then
-    printf '\n\033[2m── press any key to return to the dashboard ──\033[0m'
+    printf '\n\033[2m── press any key to return to the dashboard (q to quit) ──\033[0m'
   else
-    printf '\n-- press any key to return to the dashboard --'
+    printf '\n-- press any key to return to the dashboard (q to quit) --'
   fi
-  read -rsn 1 _ 2>/dev/null || true
+  local key
+  read -rsn 1 key 2>/dev/null || true
   printf '\n'
+  # Treat 'q' as quit-from-anywhere so the user has a consistent way
+  # out without bouncing back to the dashboard first.
+  if [[ "$key" == "q" || "$key" == "Q" ]]; then
+    DASHBOARD_QUIT=1
+  fi
 }
 
 # Drop into a single-line command prompt below the dashboard. Optional
@@ -1873,9 +2139,14 @@ prompt_and_run() {
     prompt_marker='>'
   fi
   echo
-  # Show the prompt + any locked-in prefix. The prefix isn't editable
-  # (deliberate: it's the dashboard shortcut they pressed), so we print
-  # it literally and read the user's continuation.
+  # Show explicit "how to go back" hint so users don't feel trapped in
+  # command mode with no obvious exit. Empty Enter or Ctrl-D returns
+  # to the dashboard immediately (no "press any key" required).
+  if [[ $has_color -eq 1 ]]; then
+    printf '\033[2m  (type a command and press Enter, or press Enter alone / Ctrl-D to go back)\033[0m\n'
+  else
+    printf '  (type a command and press Enter, or press Enter alone / Ctrl-D to go back)\n'
+  fi
   if [[ -n "$prefix" ]]; then
     printf '%s %s' "$prompt_marker" "$prefix"
   else
@@ -1883,7 +2154,12 @@ prompt_and_run() {
   fi
   local line
   if ! IFS= read -r line; then
+    # Ctrl-D / EOF — silent return to dashboard.
     echo
+    return 0
+  fi
+  # Empty Enter (no prefix to combine) — also silent return.
+  if [[ -z "$line" && -z "$prefix" ]]; then
     return 0
   fi
   echo
@@ -1901,23 +2177,36 @@ dashboard_loop() {
   DASHBOARD_ROWS_CACHE=""
   DASHBOARD_CACHE_AT=0
 
-  # Ctrl-C exits gracefully (default would kill the script with 130 and
-  # leave the terminal in a weird state).
+  # Quit-confirmation state (Claude-Code style): the first Ctrl-D /
+  # Esc press arms a quit-pending flag that expires after 3s. A
+  # second press within that window actually quits. `q` is explicit
+  # and quits on a single press.
+  local quit_pending_at=0
+  local quit_pending_reason=""
+
   trap 'echo; DASHBOARD_QUIT=1' INT
 
-  # Initial fetch so the first paint has data.
   _dashboard_refresh_cache
 
   while [[ $DASHBOARD_QUIT -eq 0 ]]; do
-    # Cache-driven render — no API call here. Only timer-fires and [r]
-    # invoke _dashboard_refresh_cache, so post-command redraws are
-    # instant and don't re-hit the API.
+    # Expire pending quit after 3s.
+    if (( quit_pending_at > 0 && SECONDS - quit_pending_at > 3 )); then
+      quit_pending_at=0
+      quit_pending_reason=""
+    fi
+
     render_dashboard "$has_color" "$refresh"
 
-    # Time-to-next-refresh = refresh - age. When that's <=0, refresh
-    # immediately (use a fractional 0.01s timeout — `read -t 0` returns
-    # immediately regardless of input availability, which is what we
-    # want for steady-state on-interval refreshing without a 1s drift).
+    # If a quit is pending, surface the confirm hint right above the
+    # input line so the user sees how to confirm or back out.
+    if [[ -n "$quit_pending_reason" ]]; then
+      if [[ $has_color -eq 1 ]]; then
+        printf '\033[33m  press %s again to quit (or any other key to cancel)\033[0m\n' "$quit_pending_reason"
+      else
+        printf '  press %s again to quit (or any other key to cancel)\n' "$quit_pending_reason"
+      fi
+    fi
+
     local age=$(( SECONDS - DASHBOARD_CACHE_AT ))
     local remaining=$(( refresh - age ))
     local read_timeout="$remaining"
@@ -1927,28 +2216,53 @@ dashboard_loop() {
     read -rsn 1 -t "$read_timeout" key
     rc=$?
 
-    # rc=0: keypress. rc=142 (or anything 128+): timeout. rc=1: EOF/error.
     if [[ $rc -eq 1 ]]; then
-      DASHBOARD_QUIT=1
+      # EOF / Ctrl-D
+      if [[ "$quit_pending_reason" == "Ctrl-D" ]]; then
+        DASHBOARD_QUIT=1
+        continue
+      fi
+      quit_pending_at=$SECONDS
+      quit_pending_reason="Ctrl-D"
       continue
     fi
 
     case "$key" in
       q|Q) DASHBOARD_QUIT=1 ;;
-      r|R) _dashboard_refresh_cache ;;             # explicit refresh
+      $'\e')   # Esc
+        if [[ "$quit_pending_reason" == "Esc" ]]; then
+          DASHBOARD_QUIT=1
+        else
+          quit_pending_at=$SECONDS
+          quit_pending_reason="Esc"
+        fi
+        ;;
+      r|R)
+        _dashboard_refresh_cache
+        quit_pending_at=0; quit_pending_reason=""
+        ;;
       h|H|"?")
+        quit_pending_at=0; quit_pending_reason=""
         repl_help
         _pause_for_keypress "$has_color"
         ;;
-      c|C) prompt_and_run "$has_color" ;;
-      a|A) prompt_and_run "$has_color" "add " ;;
+      c|C)
+        quit_pending_at=0; quit_pending_reason=""
+        prompt_and_run "$has_color"
+        ;;
+      a|A)
+        quit_pending_at=0; quit_pending_reason=""
+        prompt_and_run "$has_color" "add "
+        ;;
       "")
-        # Timeout — refresh cache so the next render shows fresh data.
+        # Timeout — refresh and clear any pending-quit so the hint
+        # doesn't linger across the auto-refresh cycle.
         _dashboard_refresh_cache
+        quit_pending_at=0; quit_pending_reason=""
         ;;
       *)
-        # Brief feedback on unknown keys — better than silent no-op so
-        # the user doesn't think the dashboard is frozen.
+        # Any other key cancels a pending quit and shows the help hint.
+        quit_pending_at=0; quit_pending_reason=""
         if [[ $has_color -eq 1 ]]; then
           printf '\r\033[2m  (unknown key — press [h] for help, [q] to quit)\033[0m'
         else
@@ -2029,7 +2343,7 @@ main() {
     subcommand="list"
   else
     case "${args[0]}" in
-      list|status|local|start|stop|restart|logs|notify|watch|add|remove|stats|update|doctor|info)
+      list|status|local|start|stop|restart|logs|notify|watch|add|remove|stats|update|doctor|info|setup)
         subcommand="${args[0]}"
         positional=("${args[@]:1}")
         ;;
