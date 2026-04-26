@@ -873,14 +873,17 @@ EOF
       local target="${positional[1]}"
       validate_repo "$repo" || return 2
 
-      # Resolve name → id if needed
-      local runner_id
+      # Resolve name → id (and id → name when caller gave an id, so the
+      # cleanup hint can build a correct LaunchAgent label).
+      local runner_id runner_name
+      local runners_json
+      runners_json=$(gh api "repos/${repo}/actions/runners" --paginate 2>/dev/null || echo '{"runners":[]}')
       if [[ "$target" =~ ^[0-9]+$ ]]; then
         runner_id="$target"
+        runner_name=$(jq -r --argjson id "$target" '.runners[] | select(.id == $id) | .name' <<<"$runners_json" | head -1)
       else
-        local runners_json
-        runners_json=$(gh api "repos/${repo}/actions/runners" --paginate 2>/dev/null || echo '{"runners":[]}')
         runner_id=$(jq -r --arg n "$target" '.runners[] | select(.name == $n) | .id' <<<"$runners_json" | head -1)
+        runner_name="$target"
         if [[ -z "$runner_id" ]]; then
           echo "error: no runner named '$target' in $repo" >&2
           echo "tip: list runners with \`gh runner-status $repo\`" >&2
@@ -892,30 +895,47 @@ EOF
         echo "error: failed to deregister runner $runner_id from $repo" >&2
         return 1
       fi
-      echo "deregistered runner $target ($runner_id) from $repo"
+      echo "deregistered runner ${runner_name:-$target} ($runner_id) from $repo"
       echo "note: local files (LaunchAgent, runner directory) are untouched."
       echo "      to fully uninstall locally:"
-      echo "        gh runner-status stop actions.runner.${repo//\//-}.${target}"
+      if [[ -n "$runner_name" ]]; then
+        echo "        gh runner-status stop actions.runner.${repo//\//-}.${runner_name}"
+      else
+        echo "        gh runner-status stop actions.runner.${repo//\//-}.<runner-name>"
+      fi
       echo "        rm -rf <runner_install_dir>"
       ;;
 
     watch)
-      # `watch [SECONDS]` — same active dashboard as bare `gh runner-status`,
-      # but with a custom refresh interval. Single-key controls (q/r/c/a/h)
-      # work the same as the default REPL.
+      # `watch [SECONDS] [REPOS...]` — same active dashboard as bare
+      # `gh runner-status`, with a custom refresh interval and an
+      # optional repo subset. Single-key controls (q/r/c/a/h) work in
+      # both TTY and the non-TTY fallback (no key handling there).
       local interval="${WATCH_INTERVAL:-30}"
       if [[ "${positional[0]:-}" =~ ^[0-9]+$ ]]; then
         interval="${positional[0]}"
+        positional=("${positional[@]:1}")
       fi
       if [[ ! -t 0 || ! -t 1 ]]; then
-        # Non-TTY: fall back to a simple refresh-and-print loop so cron/
-        # piped use still works without trying to read keys from /dev/null.
+        # Non-TTY (cron, piped): print-and-sleep loop. Repo args
+        # forward to `list` if given.
         while true; do
-          dispatch_subcommand list || true
+          dispatch_subcommand list ${positional[@]:+"${positional[@]}"} || true
           sleep "$interval"
           echo
         done
       else
+        # TTY: enter the dashboard loop. The dashboard always reads
+        # repos from CONFIG_FILE (passing repos to `list` via the
+        # dashboard isn't wired through render_dashboard yet — would
+        # require threading the args through; left as a follow-up).
+        # If the caller passed explicit repos, hint that they're
+        # currently filtered out.
+        if [[ ${#positional[@]} -gt 0 ]]; then
+          # shellcheck disable=SC2016 # backticks are intentional literal text in the user-facing hint
+          printf '\033[33m(note: `watch SECONDS REPOS...` repo filter not yet supported in TTY dashboard;\n showing all configured repos. Use `gh runner-status owner/repo` for one-off filtering.)\033[0m\n' >&2
+          sleep 2
+        fi
         dashboard_loop "$interval"
       fi
       ;;
@@ -1120,10 +1140,12 @@ handle_repl_line() {
 }
 
 # Drop into a single-line command prompt below the dashboard.
-# Returns to dashboard after the command runs (and the user presses
-# any key on the "press any key to return" hint).
+# Optional second arg pre-fills the input line (used by the [/] and
+# [a] dashboard shortcuts to give the user a head start). Returns to
+# the dashboard after the command runs.
 prompt_and_run() {
   local has_color="$1"
+  local prefill="${2:-}"
   local prompt
   if [[ $has_color -eq 1 ]]; then
     prompt=$'\001\033[36m\002❯\001\033[0m\002 '
@@ -1132,9 +1154,19 @@ prompt_and_run() {
   fi
   echo
   local line
-  if ! IFS= read -r -e -p "$prompt" line; then
-    echo
-    return 0
+  # `read -e -i <text>` pre-fills the readline buffer with <text>, so
+  # the user sees `❯ /` or `❯ add ` and can type the rest. Falls back
+  # to plain prompt if -i is unsupported (older bash).
+  if [[ -n "$prefill" ]]; then
+    if ! IFS= read -r -e -i "$prefill" -p "$prompt" line 2>/dev/null; then
+      echo
+      return 0
+    fi
+  else
+    if ! IFS= read -r -e -p "$prompt" line; then
+      echo
+      return 0
+    fi
   fi
   echo
   handle_repl_line "$has_color" "$line"
@@ -1162,19 +1194,31 @@ dashboard_loop() {
   while [[ $DASHBOARD_QUIT -eq 0 ]]; do
     render_dashboard "$has_color" "$refresh"
 
-    local key=""
+    local key="" rc=0
     # Silent, single-char read with a timeout. Timeout → redraw with
-    # fresh data. Keypress → handle.
-    read -rsn 1 -t "$refresh" key 2>/dev/null || true
+    # fresh data. Keypress → handle. EOF (Ctrl-D, closed stdin) returns
+    # non-zero with empty key — distinguish from a timeout via $rc.
+    read -rsn 1 -t "$refresh" key
+    rc=$?
+
+    # rc=0: got a key. rc=142 (timeout). rc=1+: EOF/error.
+    if [[ $rc -gt 1 ]]; then
+      DASHBOARD_QUIT=1
+      continue
+    fi
 
     case "$key" in
       q|Q) DASHBOARD_QUIT=1 ;;
       r|R) ;; # fall through, loop redraws
-      h|H|"?") repl_help; printf '\nPress any key...'; read -rsn 1 _ 2>/dev/null; printf '\n' ;;
+      h|H|"?")
+        repl_help
+        printf '\nPress any key...'
+        read -rsn 1 _ 2>/dev/null
+        printf '\n'
+        ;;
       c|C) prompt_and_run "$has_color" ;;
-      /)   handle_repl_line "$has_color" "/"
-           prompt_and_run "$has_color" ;;
-      a|A) prompt_and_run "$has_color" ;;
+      /)   prompt_and_run "$has_color" "/" ;;     # pre-fill slash
+      a|A) prompt_and_run "$has_color" "add " ;;  # pre-fill add command
       "")  ;; # timeout, just redraw
       *)   ;; # ignore other keys
     esac
