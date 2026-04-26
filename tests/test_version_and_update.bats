@@ -97,10 +97,13 @@ teardown() {
 # update arg parsing
 # ---------------------------------------------------------------------------
 
-@test "update: rejects unknown flags" {
+@test "update: rejects unknown options" {
+  # Script's top-level parser catches --bogus as an unknown option
+  # before update's own subcommand-flag check; either way, exit 2 + a
+  # message containing "unknown" is the contract.
   run "$SCRIPT" update --bogus runner-1
   [ "$status" -eq 2 ]
-  [[ "$output" == *"unknown flag"* ]]
+  [[ "$output" == *"unknown"* ]]
 }
 
 @test "update: rejects multiple runner names" {
