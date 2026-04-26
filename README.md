@@ -27,7 +27,47 @@ GitHub's UI makes you click into each repo's Settings → Actions → Runners pa
 - A machine rebooted — did all its runners come back?
 - You want a midnight cron that pings you if any runner went offline overnight.
 
+## Prerequisites
+
+You need `gh` (the GitHub CLI), `jq`, and `curl`. Install them once if you don't have them:
+
+**macOS** (Homebrew):
+
+```bash
+brew install gh jq curl
+```
+
+**Debian / Ubuntu**:
+
+```bash
+sudo apt-get update && sudo apt-get install -y gh jq curl
+```
+
+**Fedora / RHEL**:
+
+```bash
+sudo dnf install -y gh jq curl
+```
+
+**Arch**:
+
+```bash
+sudo pacman -S github-cli jq curl
+```
+
+For other platforms, see [`gh` installation docs](https://github.com/cli/cli#installation). `bash` 3.2+ is required (already the default on macOS and every modern Linux distro).
+
+Then authenticate `gh` once:
+
+```bash
+gh auth login
+```
+
+Pick HTTPS, your preferred auth flow, and when asked for scopes make sure `repo` is selected (the default for private repos).
+
 ## Install
+
+Once the prereqs are in place, install the extension with one command:
 
 ```bash
 gh extension install crgeee/gh-runner-status
@@ -39,20 +79,19 @@ Upgrade later:
 gh extension upgrade gh-runner-status
 ```
 
-## Requirements
+That's it — `gh runner-status` is now in your `PATH`.
 
-| Dep | Why |
+## What each prereq is for
+
+| Tool | Why |
 |---|---|
-| `gh` | Already authenticated via `gh auth login` |
+| `gh` | API calls + extension framework |
 | `jq` | JSON parsing |
-| `curl` | Only required if using `notify` |
-| `bash` 3.2+ | Default macOS bash works |
-
-A `gh` token with `repo` scope (the default for `gh auth login` against private repos).
+| `curl` | Only required for `notify` (Telegram alerts) |
 
 Local control (`start`/`stop`/`restart`/`logs`) targets:
-- macOS — LaunchAgents at `~/Library/LaunchAgents/actions.runner.*.plist` (the path GitHub's installer uses)
-- Linux — `systemd` user services or system services named `actions.runner.*.service`
+- **macOS** — LaunchAgents at `~/Library/LaunchAgents/actions.runner.*.plist` (the path GitHub's installer uses)
+- **Linux** — `systemd` user services or system services named `actions.runner.*.service`
 
 ## Usage
 
