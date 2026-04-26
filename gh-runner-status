@@ -337,7 +337,6 @@ render_table() {
         -v c_ok="${THEME_OK:-}" \
         -v c_err="${THEME_ERR:-}" \
         -v c_warn="${THEME_WARN:-}" \
-        -v c_dim="${THEME_DIM:-}" \
         -v c_reset="${THEME_RESET:-}" '
     BEGIN { wr=4; wn=4; ws=6; wb=4; wu=6; wc=3; wm=3; wv=7 }
     function fmt_kb(kb) {
@@ -2311,8 +2310,9 @@ dashboard_loop() {
         # already buffered; lone Esc has nothing following.
         local _rest=""
         if read -rsn 2 -t 0.05 _rest 2>/dev/null && [[ -n "$_rest" ]]; then
-          # Escape sequence (arrow key, etc.) — ignore.
-          :
+          # Escape sequence (arrow key, etc.). Treat as "any other key"
+          # so it cancels a pending quit, matching the UI hint.
+          quit_pending_at=0; quit_pending_reason=""
         else
           if [[ "$quit_pending_reason" == "Esc" ]]; then
             DASHBOARD_QUIT=1

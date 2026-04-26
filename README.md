@@ -210,7 +210,7 @@ GH_RUNNER_STATUS_THEME=neon gh runner-status
 echo 'export GH_RUNNER_STATUS_THEME=neon' >> ~/.zshrc    # make it stick
 ```
 
-Status icons (`✓`/`✗`/`⚠`) prefix each row when stdout is a TTY. Set `NO_ICONS=1` to disable for ASCII-only environments.
+Status icons (`✓`/`✗`/`⚠`) prefix each row by default. Set `NO_ICONS=1` to disable for ASCII-only environments or log viewers that don't render unicode.
 
 ## Shell autocomplete
 
