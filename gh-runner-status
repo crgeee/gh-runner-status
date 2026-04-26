@@ -331,7 +331,13 @@ render_table() {
       (.version_status // ""),
       (if .labels then (.labels | join(",")) else "-" end)
     ] | @tsv' <<<"$rows" \
-  | awk -F'\t' -v color="$color_enabled" -v icons="$icons_enabled" '
+  | awk -F'\t' \
+        -v color="$color_enabled" \
+        -v icons="$icons_enabled" \
+        -v c_ok="${THEME_OK:-}" \
+        -v c_err="${THEME_ERR:-}" \
+        -v c_warn="${THEME_WARN:-}" \
+        -v c_reset="${THEME_RESET:-}" '
     BEGIN { wr=4; wn=4; ws=6; wb=4; wu=6; wc=3; wm=3; wv=7 }
     function fmt_kb(kb) {
       if (kb == "" || kb == 0) return "-"
@@ -392,10 +398,10 @@ render_table() {
         split(lines[i], f, "\t")
         c = ""; r = ""
         if (color) {
-          r = "\033[0m"
-          if (f[3] == "online")  c = "\033[32m"
-          else if (f[3] == "offline") c = "\033[31m"
-          else if (f[3] == "error")   c = "\033[33m"
+          r = c_reset
+          if (f[3] == "online")       c = c_ok
+          else if (f[3] == "offline") c = c_err
+          else if (f[3] == "error")   c = c_warn
         }
         ic = icon_for(f[3])
         if (icons) printf "%s%s ", c, ic
@@ -1946,6 +1952,62 @@ to run one-shot from your shell (e.g. `gh runner-status doctor`).
 EOF
 }
 
+# Theme palette. Override with GH_RUNNER_STATUS_THEME=light|dark|neon
+# (default: dark). Each theme is a set of ANSI color escapes the
+# renderers consume — keeps color choices in one place.
+_theme_init() {
+  local theme="${GH_RUNNER_STATUS_THEME:-dark}"
+  case "$theme" in
+    light)
+      # Lighter terminals: avoid dim-grey on white bg (unreadable).
+      # Use bold + standard colors with darker accents.
+      THEME_BANNER=$'\033[1;34m'      # bold blue
+      THEME_BANNER_META=$'\033[34m'   # blue
+      THEME_PROMPT=$'\033[1;35m'      # bold magenta
+      THEME_HOTKEY=$'\033[1;33m'      # bold yellow
+      THEME_HOTKEY_LBL=$'\033[33m'    # yellow
+      THEME_OK=$'\033[1;32m'          # bold green
+      THEME_WARN=$'\033[1;33m'        # bold yellow
+      THEME_ERR=$'\033[1;31m'         # bold red
+      THEME_DIM=$'\033[2;90m'         # dim grey (subtle)
+      THEME_RULE=$'\033[34m'          # blue
+      THEME_RESET=$'\033[0m'
+      ;;
+    neon)
+      # High-contrast popping colors. Looks great on a dark bg.
+      THEME_BANNER=$'\033[1;38;5;201m'   # hot pink
+      THEME_BANNER_META=$'\033[38;5;213m' # lighter pink
+      THEME_PROMPT=$'\033[1;38;5;51m'    # bright cyan
+      THEME_HOTKEY=$'\033[1;38;5;226m'   # bright yellow
+      THEME_HOTKEY_LBL=$'\033[38;5;220m' # gold
+      THEME_OK=$'\033[1;38;5;46m'        # vivid green
+      THEME_WARN=$'\033[1;38;5;214m'     # orange
+      THEME_ERR=$'\033[1;38;5;196m'      # vivid red
+      THEME_DIM=$'\033[38;5;240m'        # mid grey
+      THEME_RULE=$'\033[38;5;141m'       # purple
+      THEME_RESET=$'\033[0m'
+      ;;
+    dark|*)
+      # Default: dark terminal, bright text. Still pops without being
+      # garish. Bright variants of the standard 8 colors.
+      THEME_BANNER=$'\033[1;96m'         # bright cyan, bold
+      THEME_BANNER_META=$'\033[96m'      # bright cyan
+      THEME_PROMPT=$'\033[1;96m'         # bright cyan, bold
+      THEME_HOTKEY=$'\033[1;93m'         # bright yellow, bold
+      THEME_HOTKEY_LBL=$'\033[37m'       # white
+      THEME_OK=$'\033[1;92m'             # bright green
+      THEME_WARN=$'\033[1;93m'           # bright yellow
+      THEME_ERR=$'\033[1;91m'            # bright red
+      THEME_DIM=$'\033[2;37m'            # dim grey
+      THEME_RULE=$'\033[2;36m'           # dim cyan
+      THEME_RESET=$'\033[0m'
+      ;;
+  esac
+}
+
+# Initialize once on script load so the env-var check happens early.
+_theme_init
+
 render_repl_banner() {
   local has_color="$1"
   local short_host
@@ -1954,8 +2016,13 @@ render_repl_banner() {
   local now
   now=$(date '+%H:%M:%S')
   if [[ $has_color -eq 1 ]]; then
-    printf '\033[1;36m▸ gh-runner-status\033[0m \033[2mv%s • %s • %s\033[0m\n' \
-      "$VERSION" "${short_host:-localhost}" "$now"
+    printf '%s▸ gh-runner-status%s %sv%s%s %s•%s %s%s%s %s•%s %s%s%s\n' \
+      "$THEME_BANNER" "$THEME_RESET" \
+      "$THEME_BANNER_META" "$VERSION" "$THEME_RESET" \
+      "$THEME_DIM" "$THEME_RESET" \
+      "$THEME_BANNER_META" "${short_host:-localhost}" "$THEME_RESET" \
+      "$THEME_DIM" "$THEME_RESET" \
+      "$THEME_BANNER_META" "$now" "$THEME_RESET"
   else
     printf 'gh-runner-status v%s • %s • %s\n' "$VERSION" "${short_host:-localhost}" "$now"
   fi
@@ -1965,7 +2032,14 @@ render_repl_footer() {
   local has_color="$1"
   local refresh="${2:-30}"
   if [[ $has_color -eq 1 ]]; then
-    printf '\033[2m─ refreshing every %ss • \033[0m[r]\033[2mefresh \033[0m[c]\033[2mommand \033[0m[a]\033[2mdd \033[0m[h]\033[2melp \033[0m[q]\033[2muit\033[0m\n' "$refresh"
+    # Each [key] is bright; the label after it is dimmer so the
+    # hotkey itself "pops" without making the whole line shouty.
+    printf '%s─ refreshing every %ss • %s' "$THEME_RULE" "$refresh" "$THEME_RESET"
+    printf '%s[r]%s%sefresh %s' "$THEME_HOTKEY" "$THEME_RESET" "$THEME_HOTKEY_LBL" "$THEME_RESET"
+    printf '%s[c]%s%sommand %s' "$THEME_HOTKEY" "$THEME_RESET" "$THEME_HOTKEY_LBL" "$THEME_RESET"
+    printf '%s[a]%s%sdd %s'     "$THEME_HOTKEY" "$THEME_RESET" "$THEME_HOTKEY_LBL" "$THEME_RESET"
+    printf '%s[h]%s%selp %s'    "$THEME_HOTKEY" "$THEME_RESET" "$THEME_HOTKEY_LBL" "$THEME_RESET"
+    printf '%s[q]%s%suit%s\n'   "$THEME_HOTKEY" "$THEME_RESET" "$THEME_HOTKEY_LBL" "$THEME_RESET"
   else
     printf -- '- refreshing every %ss • [r]efresh [c]ommand [a]dd [h]elp [q]uit\n' "$refresh"
   fi
@@ -2134,7 +2208,7 @@ prompt_and_run() {
   local prefix="${2:-}"
   local prompt_marker
   if [[ $has_color -eq 1 ]]; then
-    prompt_marker=$'\033[36m❯\033[0m'
+    prompt_marker="${THEME_PROMPT}❯${THEME_RESET}"
   else
     prompt_marker='>'
   fi
@@ -2229,12 +2303,23 @@ dashboard_loop() {
 
     case "$key" in
       q|Q) DASHBOARD_QUIT=1 ;;
-      $'\e')   # Esc
-        if [[ "$quit_pending_reason" == "Esc" ]]; then
-          DASHBOARD_QUIT=1
+      $'\e')
+        # `\e` is both lone Esc AND the first byte of escape sequences
+        # (arrow keys, function keys). Distinguish by trying to read 2
+        # more bytes with a 50ms timeout — arrow keys have those bytes
+        # already buffered; lone Esc has nothing following.
+        local _rest=""
+        if read -rsn 2 -t 0.05 _rest 2>/dev/null && [[ -n "$_rest" ]]; then
+          # Escape sequence (arrow key, etc.). Treat as "any other key"
+          # so it cancels a pending quit, matching the UI hint.
+          quit_pending_at=0; quit_pending_reason=""
         else
-          quit_pending_at=$SECONDS
-          quit_pending_reason="Esc"
+          if [[ "$quit_pending_reason" == "Esc" ]]; then
+            DASHBOARD_QUIT=1
+          else
+            quit_pending_at=$SECONDS
+            quit_pending_reason="Esc"
+          fi
         fi
         ;;
       r|R)
