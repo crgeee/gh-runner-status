@@ -43,9 +43,40 @@ gh runner-status stats                        # aggregate fleet view
 gh runner-status notify                       # Telegram alert if anything offline
 ```
 
-## Configure your fleet
+## Your first runner (zero to running in one command)
 
-Drop one repo per line in `~/.config/gh-runner-status/repos`:
+Already have `gh-runner-status` installed? Setting up a fresh self-hosted runner is one command:
+
+```bash
+gh runner-status setup acme-corp/api
+```
+
+That single command:
+1. Mints a registration token via the GitHub API
+2. Downloads the latest [actions/runner](https://github.com/actions/runner) tarball for your platform
+3. Extracts to `~/.gh-runners/acme-corp-api-<hostname>/`
+4. Runs `config.sh` non-interactively
+5. Installs as a service (LaunchAgent on macOS, systemd on Linux)
+6. **Patches `KeepAlive` into the LaunchAgent** so a crashed runner auto-recovers
+7. Starts it
+8. Polls the GitHub API until the runner reports `online` (up to 30s)
+9. Adds the repo to your gh-runner-status config
+
+Customize:
+
+```bash
+gh runner-status setup acme-corp/api \
+    --name my-runner \
+    --labels gpu,linux,x64 \
+    --dir /opt/runners/acme-api \
+    --yes              # skip the confirmation prompt
+```
+
+After it lands, run `gh runner-status doctor` to verify the host is configured for reboot resilience (auto-login, sleep settings, etc.).
+
+## Configure your fleet manually
+
+If you'd rather edit by hand, drop one repo per line in `~/.config/gh-runner-status/repos`:
 
 ```
 acme-corp/api
@@ -53,7 +84,7 @@ acme-corp/web
 acme-corp/data
 ```
 
-Or use `gh runner-status add OWNER/REPO` — it appends the repo to the config and prints the registration steps.
+Or use `gh runner-status add OWNER/REPO` — it appends the repo to the config and prints the registration steps without auto-installing.
 
 ## Dashboard
 
@@ -77,6 +108,28 @@ The main `list` table includes **CPU, MEM, UPTIME, and VERSION** automatically f
 ✓ acme-corp/api  runner-1  online  no   5d 2h  0.0%   53M   2.334.0   linux,x64
 ✓ acme-corp/api  runner-2  online  yes  5d 2h  42.1%  187M  2.334.0   linux,x64
 ✗ acme-corp/web  runner-1  offline no   -      -      -     2.333.1*  linux,x64
+```
+
+## Reboot resilience
+
+`doctor` doesn't just check that runners are online — it checks the host is configured to *stay* online after a reboot:
+
+- **macOS auto-login** — LaunchAgents only fire on user login. Without auto-login, a headless reboot leaves all runners offline until someone physically signs in. `doctor` flags this with the exact System Settings path to fix it.
+- **`pmset` sleep** — if the mac sleeps, runners stop responding. `doctor` checks `sleep=0` and shows the `pmset` command to set it.
+- **LaunchAgent `KeepAlive`** — without it, a single Runner.Listener crash leaves you offline. `setup` adds this automatically; `doctor` flags any runner missing it.
+- **Linux systemd `Restart=`** — flags runners with `Restart=no` (won't recover from crashes).
+
+```
+$ gh runner-status doctor
+Health check (latest runner version: 2.334.0)
+
+  ✗ actions.runner.acme-api.runner-1
+      - LaunchAgent missing KeepAlive — runner won't auto-restart on crash
+
+Host resilience:
+  ✗ auto-login not enabled — runners will NOT auto-start after reboot
+      fix: System Settings → Users & Groups → Login Options → Automatic login
+  ✓ system sleep disabled (sleep=0)
 ```
 
 ## Update + doctor
