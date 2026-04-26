@@ -12,6 +12,13 @@ file automatically. The "Unreleased" section is what release-please
 will roll into the next tagged release.
 -->
 
+## [0.3.6](https://github.com/crgeee/gh-runner-status/compare/v0.3.5...v0.3.6) (2026-04-26)
+
+
+### Bug Fixes
+
+* bash 3.2 fractional read timeouts + CI portability lint ([#14](https://github.com/crgeee/gh-runner-status/issues/14)) ([c9c8f47](https://github.com/crgeee/gh-runner-status/commit/c9c8f471b8f2416ca28cdef39ba42e13c404e817))
+
 ## [0.3.5](https://github.com/crgeee/gh-runner-status/compare/v0.3.4...v0.3.5) (2026-04-26)
 
 
