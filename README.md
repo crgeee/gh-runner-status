@@ -3,135 +3,77 @@
 [![CI](https://github.com/crgeee/gh-runner-status/actions/workflows/ci.yml/badge.svg)](https://github.com/crgeee/gh-runner-status/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A `gh` CLI extension that gives you a single view of self-hosted GitHub Actions runners across multiple repos — and lets you start, stop, restart, tail logs of the ones running on the local machine, and get a Telegram ping when something goes offline. Optional auto-refresh "watch" mode and a Claude-Code-style REPL.
+> One terminal command to see, control, and alert on every self-hosted GitHub Actions runner you own.
 
-```
-$ gh runner-status
+<p align="center">
+  <img src="docs/screenshot.svg" alt="gh-runner-status terminal screenshot" width="780" />
+</p>
 
-  REPO            NAME        STATUS   BUSY  LABELS
------------------------------------------------------
-✓ your-org/api    runner-1    online   no    self-hosted,linux,x64
-✓ your-org/api    runner-2    online   yes   self-hosted,linux,x64
-✗ your-org/web    runner-1    offline  no    self-hosted,linux,x64
-✓ your-org/data   runner-1    online   no    self-hosted,macOS,ARM64
-```
+## ⚡ Quick start
 
-`STATUS` is colorized green (online), red (offline), yellow (error) when stdout is a TTY. Status icons (`✓`/`✗`/`⚠`) can be disabled with `NO_ICONS=1`.
-
-## Why
-
-GitHub's UI makes you click into each repo's Settings → Actions → Runners page to see one fleet at a time. This bundles them into one view and adds local control + alerting. Useful when:
-
-- A CI run is hanging — is the runner online?
-- You provisioned a runner — did it register?
-- A machine rebooted — did all its runners come back?
-- You want a midnight cron that pings you if any runner went offline overnight.
-
-## Prerequisites
-
-You need `gh` (the GitHub CLI), `jq`, and `curl`. Install them once if you don't have them:
-
-**macOS** (Homebrew):
+**Three lines and you're running:**
 
 ```bash
-brew install gh jq curl
-```
-
-**Debian / Ubuntu**:
-
-```bash
-sudo apt-get update && sudo apt-get install -y gh jq curl
-```
-
-**Fedora / RHEL**:
-
-```bash
-sudo dnf install -y gh jq curl
-```
-
-**Arch**:
-
-```bash
-sudo pacman -S github-cli jq curl
-```
-
-For other platforms, see [`gh` installation docs](https://github.com/cli/cli#installation). `bash` 3.2+ is required (already the default on macOS and every modern Linux distro).
-
-Then authenticate `gh` once:
-
-```bash
-gh auth login
-```
-
-Pick HTTPS, your preferred auth flow, and when asked for scopes make sure `repo` is selected (the default for private repos).
-
-## Install
-
-Once the prereqs are in place, install the extension with one command:
-
-```bash
+brew install gh jq                                  # one-time prereqs (macOS)
+gh auth login                                       # one-time, pick HTTPS + repo scope
 gh extension install crgeee/gh-runner-status
 ```
 
-Upgrade later:
+Then:
 
 ```bash
-gh extension upgrade gh-runner-status
+gh runner-status owner/repo                         # status of one repo
+gh runner-status                                    # interactive REPL
 ```
 
-That's it — `gh runner-status` is now in your `PATH`.
+That's it.
 
-## What each prereq is for
+> **Linux?** Replace `brew install gh jq` with `sudo apt-get install -y gh jq` (Debian/Ubuntu), `sudo dnf install -y gh jq` (Fedora), or `sudo pacman -S github-cli jq` (Arch). For Telegram alerts you also need `curl` (almost certainly already installed).
 
-| Tool | Why |
-|---|---|
-| `gh` | API calls + extension framework |
-| `jq` | JSON parsing |
-| `curl` | Only required for `notify` (Telegram alerts) |
+## What it does
 
-Local control (`start`/`stop`/`restart`/`logs`) targets:
-- **macOS** — LaunchAgents at `~/Library/LaunchAgents/actions.runner.*.plist` (the path GitHub's installer uses)
-- **Linux** — `systemd` user services or system services named `actions.runner.*.service`
+- **`list`** — one table for runners across every repo you care about
+- **`start` / `stop` / `restart` / `logs`** — control runners on the local machine
+- **`watch`** — auto-refresh table on an interval
+- **`notify`** — Telegram alert when something goes offline (cron-friendly)
+- **REPL** — bare `gh runner-status` opens a Claude-Code-style prompt with slash commands
 
-## Usage
+GitHub's UI makes you click into each repo's Settings → Actions → Runners page one at a time. This bundles them into one view and adds local control + alerting.
 
-### List status
+## Configure your fleet
+
+Drop one repo per line in `~/.config/gh-runner-status/repos`:
+
+```
+acme-corp/api
+acme-corp/web
+acme-corp/data
+```
+
+Now `gh runner-status` (no args, but inside a TTY → REPL; piped/cron → table) shows them all.
+
+## Common usage
 
 ```bash
-gh runner-status                                # repos from config file
-gh runner-status owner/repo                     # one-off
-gh runner-status owner/repo-a,owner/repo-b      # comma-separated
-gh runner-status owner/repo-a owner/repo-b      # space-separated
+gh runner-status                                    # repos from config (or REPL)
+gh runner-status owner/repo                         # one-off
+gh runner-status owner/repo-a,owner/repo-b          # multiple
 gh runner-status --json | jq '.[] | select(.status == "offline")'
-```
 
-### Local runner control
-
-```bash
-gh runner-status local                          # list runners on this machine
-gh runner-status start   actions.runner.org-repo.name
-gh runner-status stop    actions.runner.org-repo.name
+gh runner-status local                              # list runners on this machine
 gh runner-status restart actions.runner.org-repo.name
-gh runner-status logs    actions.runner.org-repo.name
+
+gh runner-status watch                              # 30s auto-refresh (Ctrl-C exits)
+gh runner-status watch 5                            # 5s refresh
+
+gh runner-status notify                             # Telegram alert on issues
 ```
 
-The runner name is the LaunchAgent label on macOS (`actions.runner.OWNER-REPO.NAME`) or the systemd service name on Linux. `gh runner-status local` shows you the names.
+The runner name passed to `start`/`stop`/`restart`/`logs` is the LaunchAgent label on macOS (`actions.runner.OWNER-REPO.NAME`) or the systemd service name on Linux. `gh runner-status local` shows you the names.
 
-### Watch mode
+## Interactive REPL
 
-Refresh the table on an interval — useful while a deploy is in flight, or when you want a permanent terminal pane showing fleet health.
-
-```bash
-gh runner-status watch                          # 30s refresh (default)
-gh runner-status watch 5                        # 5s refresh
-gh runner-status watch 60 your-org/api          # specific repos only
-```
-
-`Ctrl-C` to exit.
-
-### Interactive REPL
-
-Run `gh runner-status` with no args (in a terminal) and you drop into a persistent prompt with slash commands and short aliases — same UX as Claude Code.
+Run `gh runner-status` with no args (in a terminal) and you drop into a persistent prompt with slash commands and short aliases:
 
 ```
 ▸ gh-runner-status v0.2.0
@@ -140,16 +82,11 @@ type /help for commands • Ctrl-D to exit
 ❯ list
   REPO            NAME        STATUS   BUSY  LABELS
 -----------------------------------------------------
-✓ your-org/api    runner-1    online   no    self-hosted,linux,x64
-✗ your-org/web    runner-1    offline  no    self-hosted,linux,x64
+✓ acme-corp/api   runner-1    online   no    self-hosted,linux,x64
+✗ acme-corp/web   runner-1    offline  no    self-hosted,linux,x64
 
-❯ restart actions.runner.your-org-web.runner-1
-restarted: actions.runner.your-org-web.runner-1
-
-❯ /repos
-# /home/you/.config/gh-runner-status/repos
-your-org/api
-your-org/web
+❯ restart actions.runner.acme-corp-web.runner-1
+restarted: actions.runner.acme-corp-web.runner-1
 
 ❯ /quit
 bye!
@@ -157,12 +94,7 @@ bye!
 
 Aliases inside the REPL: `l`/`ls` → `list`, `r` → `restart`, `s` → `start`, `x` → `stop`, `n` → `notify`, `w` → `watch`. Up-arrow recalls history within the session.
 
-### Telegram alerts
-
-```bash
-gh runner-status notify              # check; alert if any runner is offline/errored
-gh runner-status notify --threshold 2  # only alert if 2+ runners are offline
-```
+## Telegram alerts
 
 Set up the bot once:
 
@@ -175,28 +107,26 @@ EOF
 chmod 600 ~/.config/gh-runner-status/telegram
 ```
 
-Or pass via env: `TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... gh runner-status notify`.
-
-Then drop it in cron / launchd / a systemd timer:
+Then drop `gh runner-status notify` in cron / launchd / a systemd timer:
 
 ```cron
-# /etc/cron.d/gh-runner-watch  — every 15 minutes
-*/15 * * * * cgonzalez gh runner-status notify >/dev/null 2>&1
+# /etc/cron.d/runner-watch — every 15 minutes
+*/15 * * * * you gh runner-status notify >/dev/null 2>&1
 ```
 
-Errored repo lookups (e.g., expired token) are treated as a critical condition and always alert, regardless of `--threshold`.
+`--threshold N` only alerts when N+ runners are offline. Errored repo lookups (e.g., expired token) always alert regardless of threshold — silent failure is the worst outcome.
 
-## Config file
+## Config file format
 
-Lives at `$XDG_CONFIG_HOME/gh-runner-status/repos` (or `~/.config/gh-runner-status/repos`). One `owner/name` per line; `#` starts a comment.
+Lives at `$XDG_CONFIG_HOME/gh-runner-status/repos` (default `~/.config/gh-runner-status/repos`). One `owner/name` per line; `#` starts a comment.
 
 ```
 # my fleet
-your-org/api
-your-org/web
+acme-corp/api
+acme-corp/web
 
 # data team
-your-org/data-pipeline
+acme-corp/data-pipeline
 ```
 
 ## JSON output
@@ -206,7 +136,7 @@ your-org/data-pipeline
 ```json
 [
   {
-    "repo": "your-org/api",
+    "repo": "acme-corp/api",
     "name": "runner-1",
     "status": "online",
     "busy": false,
@@ -222,33 +152,38 @@ your-org/data-pipeline
 
 A bad repo doesn't crash the run — its row appears with the error inline.
 
-## Security model
+## Local runner control
 
-This is a public tool that handles a Telegram bot token (sensitive) and shells out to `gh`, `curl`, `launchctl`, and `systemctl`. The script is hardened against the obvious threats:
+`start`/`stop`/`restart`/`logs` target:
+- **macOS** — LaunchAgents at `~/Library/LaunchAgents/actions.runner.*.plist` (the path GitHub's installer uses)
+- **Linux** — `systemd` user services or system services named `actions.runner.*.service`
 
-- **Repo names and runner names are regex-validated** before reaching `gh api`, `launchctl`, `systemctl`, or `tail` so a name like `--no-block` or `../../foo` is rejected at the boundary.
-- **Telegram config is parsed, not sourced.** A malicious `~/.config/gh-runner-status/telegram` file cannot run code — only `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` keys are extracted from a key=value parser.
-- **Bot token never lands in argv.** The Telegram POST is sent via `curl --config -` (stdin), so `ps auxe` from another user can't see it.
-- **`set -euo pipefail`** throughout; `EXIT` trap cleans up the temp directory; failures don't mask silently.
-- **No `eval`, no `bash -c "$user_input"`, no `source` of untrusted files.**
+## Security
 
-If you find a security issue, open an issue or PR — happy to credit reporters.
+See [SECURITY.md](SECURITY.md) for the full threat model. Highlights:
 
-## Development
+- Repo + runner names regex-validated before reaching `gh api` / `launchctl` / `systemctl` / `tail`
+- Telegram config is **parsed**, never sourced — malicious config can't run code
+- Bot token sent via `curl --config -` (stdin), never lands in argv
+- `set -euo pipefail` throughout; `EXIT` trap cleans up temp files
+
+Found a security issue? Please don't open a public issue — see [SECURITY.md](SECURITY.md).
+
+## Status icons & colors
+
+`STATUS` is colorized green (online), red (offline), yellow (error) when stdout is a TTY. Status icons (`✓`/`✗`/`⚠`) prefix each row. Set `NO_ICONS=1` to disable for ASCII-only environments.
+
+## Contributing
+
+PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). The project is intentionally tiny: pure bash, no build step, dev-only deps are `bats-core` + `shellcheck` (CI installs them automatically).
 
 ```bash
 git clone https://github.com/crgeee/gh-runner-status
 cd gh-runner-status
-shellcheck gh-runner-status        # lint
-bats tests/                        # 32 tests covering arg parsing,
-                                   # validation, telegram-config safety,
-                                   # and table rendering
-./gh-runner-status owner/repo      # smoke test
+shellcheck gh-runner-status     # lint
+bats tests/                     # 38 hermetic tests
+./gh-runner-status owner/repo   # smoke test
 ```
-
-CI runs shellcheck + bats on Linux + macOS for every push and PR. Coverage is generated with `kcov` and uploaded as a workflow artifact (and to Codecov when a token is set).
-
-Pure bash. No build step. No dependencies beyond `gh` + `jq` + `curl` (which you almost certainly already have). Dev-only: `bats-core` + `shellcheck` + `kcov` (CI installs them automatically).
 
 ## License
 
