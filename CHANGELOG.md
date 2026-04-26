@@ -12,6 +12,13 @@ file automatically. The "Unreleased" section is what release-please
 will roll into the next tagged release.
 -->
 
+## [0.3.5](https://github.com/crgeee/gh-runner-status/compare/v0.3.4...v0.3.5) (2026-04-26)
+
+
+### Features
+
+* visual themes (dark/light/neon) + Esc fix for arrow keys ([#12](https://github.com/crgeee/gh-runner-status/issues/12)) ([19e2f05](https://github.com/crgeee/gh-runner-status/commit/19e2f058cbb800ca6aa6a7fdeb84ed299e8d3a83))
+
 ## [0.3.4](https://github.com/crgeee/gh-runner-status/compare/v0.3.3...v0.3.4) (2026-04-26)
 
 
