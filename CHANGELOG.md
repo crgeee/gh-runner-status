@@ -12,6 +12,13 @@ file automatically. The "Unreleased" section is what release-please
 will roll into the next tagged release.
 -->
 
+## [0.3.4](https://github.com/crgeee/gh-runner-status/compare/v0.3.3...v0.3.4) (2026-04-26)
+
+
+### Features
+
+* setup subcommand + reboot resilience in doctor ([#10](https://github.com/crgeee/gh-runner-status/issues/10)) ([4eb89e8](https://github.com/crgeee/gh-runner-status/commit/4eb89e85d54676b9eeb75690872e3aaf15d98d4b))
+
 ## [0.3.3](https://github.com/crgeee/gh-runner-status/compare/v0.3.2...v0.3.3) (2026-04-26)
 
 
