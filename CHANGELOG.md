@@ -12,6 +12,13 @@ file automatically. The "Unreleased" section is what release-please
 will roll into the next tagged release.
 -->
 
+## [0.3.2](https://github.com/crgeee/gh-runner-status/compare/v0.3.1...v0.3.2) (2026-04-26)
+
+
+### Bug Fixes
+
+* dashboard caching + short runner names + shell completion ([#6](https://github.com/crgeee/gh-runner-status/issues/6)) ([8d1d289](https://github.com/crgeee/gh-runner-status/commit/8d1d289eb3505543b26aeabd9e47758936e1f1cb))
+
 ## [0.3.1](https://github.com/crgeee/gh-runner-status/compare/v0.3.0...v0.3.1) (2026-04-26)
 
 
