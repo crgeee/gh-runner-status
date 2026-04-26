@@ -1851,12 +1851,18 @@ handle_repl_line() {
 _pause_for_keypress() {
   local has_color="$1"
   if [[ $has_color -eq 1 ]]; then
-    printf '\n\033[2m── press any key to return to the dashboard ──\033[0m'
+    printf '\n\033[2m── press any key to return to the dashboard (q to quit) ──\033[0m'
   else
-    printf '\n-- press any key to return to the dashboard --'
+    printf '\n-- press any key to return to the dashboard (q to quit) --'
   fi
-  read -rsn 1 _ 2>/dev/null || true
+  local key
+  read -rsn 1 key 2>/dev/null || true
   printf '\n'
+  # Treat 'q' as quit-from-anywhere so the user has a consistent way
+  # out without bouncing back to the dashboard first.
+  if [[ "$key" == "q" || "$key" == "Q" ]]; then
+    DASHBOARD_QUIT=1
+  fi
 }
 
 # Drop into a single-line command prompt below the dashboard. Optional
@@ -1873,9 +1879,14 @@ prompt_and_run() {
     prompt_marker='>'
   fi
   echo
-  # Show the prompt + any locked-in prefix. The prefix isn't editable
-  # (deliberate: it's the dashboard shortcut they pressed), so we print
-  # it literally and read the user's continuation.
+  # Show explicit "how to go back" hint so users don't feel trapped in
+  # command mode with no obvious exit. Empty Enter or Ctrl-D returns
+  # to the dashboard immediately (no "press any key" required).
+  if [[ $has_color -eq 1 ]]; then
+    printf '\033[2m  (type a command and press Enter, or press Enter alone / Ctrl-D to go back)\033[0m\n'
+  else
+    printf '  (type a command and press Enter, or press Enter alone / Ctrl-D to go back)\n'
+  fi
   if [[ -n "$prefix" ]]; then
     printf '%s %s' "$prompt_marker" "$prefix"
   else
@@ -1883,7 +1894,12 @@ prompt_and_run() {
   fi
   local line
   if ! IFS= read -r line; then
+    # Ctrl-D / EOF — silent return to dashboard.
     echo
+    return 0
+  fi
+  # Empty Enter (no prefix to combine) — also silent return.
+  if [[ -z "$line" && -z "$prefix" ]]; then
     return 0
   fi
   echo
