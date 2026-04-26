@@ -45,9 +45,17 @@ SUBCOMMANDS:
   restart NAME    Restart a local runner.
   logs NAME       Tail the most recent stdout/stderr logs.
 
+  watch [SECONDS]
+      Auto-refresh the status table on an interval (default 30s).
+      Ctrl-C to exit.
+
   notify
       Query all configured repos and send a Telegram alert if any
       runner is offline or errored. Designed for cron / launchd.
+
+  (no args, in a TTY)
+      Drops into an interactive REPL with slash commands and
+      short-form aliases. See in-REPL `/help` for details.
 
 OPTIONS:
   --config FILE   Read repos from FILE (one per line). Default:
@@ -226,6 +234,12 @@ render_table() {
   local color_enabled=0
   [[ -t 1 ]] && color_enabled=1
 
+  # Status icons add a glanceable signal column that pairs with the
+  # text status. Disabled with NO_ICONS=1 for environments that don't
+  # render unicode reliably (some CI log viewers, ASCII-only terminals).
+  local icons_enabled=1
+  [[ "${NO_ICONS:-0}" == "1" ]] && icons_enabled=0
+
   jq -rs '.[] |
     [
       (.repo // "?"),
@@ -234,8 +248,8 @@ render_table() {
       (if .busy == true then "yes" elif .busy == false then "no" else "-" end),
       (if .labels then (.labels | join(",")) else "-" end)
     ] | @tsv' <<<"$rows" \
-  | awk -F'\t' -v color="$color_enabled" '
-    BEGIN { wr=4; wn=4; ws=6; wb=4 }
+  | awk -F'\t' -v color="$color_enabled" -v icons="$icons_enabled" '
+    BEGIN { wi=2; wr=4; wn=4; ws=6; wb=4 }
     {
       lines[NR] = $0
       if (length($1) > wr) wr = length($1)
@@ -243,13 +257,21 @@ render_table() {
       if (length($3) > ws) ws = length($3)
       if (length($4) > wb) wb = length($4)
     }
+    function icon_for(status) {
+      if (!icons) return ""
+      if (status == "online")  return "✓"
+      if (status == "offline") return "✗"
+      if (status == "error")   return "⚠"
+      return "•"
+    }
     END {
-      printf "%-*s  %-*s  %-*s  %-*s  %s\n", wr, "REPO", wn, "NAME", ws, "STATUS", wb, "BUSY", "LABELS"
-      total = wr + wn + ws + wb + 20
+      hdr_icon = icons ? "  " : ""
+      printf "%s%-*s  %-*s  %-*s  %-*s  %s\n", hdr_icon, wr, "REPO", wn, "NAME", ws, "STATUS", wb, "BUSY", "LABELS"
+      total = (icons ? 4 : 0) + wr + wn + ws + wb + 20
       for (i = 0; i < total; i++) printf "-"
       printf "\n"
       for (i = 1; i <= NR; i++) {
-        n = split(lines[i], f, "\t")
+        split(lines[i], f, "\t")
         c = ""; r = ""
         if (color) {
           r = "\033[0m"
@@ -257,7 +279,10 @@ render_table() {
           else if (f[3] == "offline") c = "\033[31m"
           else if (f[3] == "error")   c = "\033[33m"
         }
-        printf "%-*s  %-*s  %s%-*s%s  %-*s  %s\n", wr, f[1], wn, f[2], c, ws, f[3], r, wb, f[4], f[5]
+        ic = icon_for(f[3])
+        if (icons) printf "%s%s ", c, ic
+        printf "%s%-*s%s  %-*s  %s%-*s%s  %-*s  %s\n", \
+          (icons ? r : ""), wr, f[1], "", wn, f[2], c, ws, f[3], r, wb, f[4], f[5]
       }
     }'
 }
@@ -564,6 +589,27 @@ dispatch_subcommand() {
       local_runner_logs "${positional[0]}"
       ;;
 
+    watch)
+      # Auto-refresh status table every N seconds (default 30).
+      local interval="${WATCH_INTERVAL:-30}"
+      if [[ "${positional[0]:-}" =~ ^[0-9]+$ ]]; then
+        interval="${positional[0]}"
+        positional=("${positional[@]:1}")
+      fi
+      command -v clear >/dev/null 2>&1 || {
+        echo "error: 'clear' is required for watch mode" >&2
+        return 2
+      }
+      while true; do
+        clear
+        printf '\033[2m▸ gh-runner-status watch (every %ss) — Ctrl-C to exit\033[0m\n' "$interval"
+        date '+%Y-%m-%d %H:%M:%S %Z'
+        echo
+        dispatch_subcommand list ${positional[@]:+"${positional[@]}"} || true
+        sleep "$interval"
+      done
+      ;;
+
     notify)
       load_telegram_config
       command -v curl >/dev/null 2>&1 || {
@@ -618,7 +664,11 @@ Inline commands (same shape as the one-shot CLI):
   stop NAME            Stop a local runner
   restart NAME         Restart a local runner
   logs NAME            Tail recent logs
+  watch [SECONDS]      Auto-refresh status table (default 30s)
   notify               Send Telegram alert if any runner is offline
+
+Aliases: `l`/`ls`=list, `r`=restart, `s`=start, `x`=stop, `n`=notify,
+`w`=watch.
 
 Tip: bare `gh runner-status` enters this REPL; pass a subcommand to
 run one-shot.
@@ -695,10 +745,19 @@ interactive_mode() {
         fi
 
         # First token is the subcommand; rest are positional args.
-        # Allow bare repo args to default to `list`.
+        # Allow bare repo args to default to `list`. Short aliases keep
+        # the REPL snappy: `l`/`ls` → list, `r` → restart, etc.
         local first="${words[0]}"
         case "$first" in
-          list|status|local|start|stop|restart|logs|notify)
+          l|ls)        words[0]="list" ;;
+          r)           words[0]="restart" ;;
+          s)           words[0]="start" ;;
+          x|stop)      words[0]="stop" ;;
+          n)           words[0]="notify" ;;
+          w)           words[0]="watch" ;;
+        esac
+        case "${words[0]}" in
+          list|status|local|start|stop|restart|logs|notify|watch)
             dispatch_subcommand "${words[@]}" || true
             ;;
           *)
@@ -768,7 +827,7 @@ main() {
     subcommand="list"
   else
     case "${args[0]}" in
-      list|status|local|start|stop|restart|logs|notify)
+      list|status|local|start|stop|restart|logs|notify|watch)
         subcommand="${args[0]}"
         positional=("${args[@]:1}")
         ;;

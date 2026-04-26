@@ -3,20 +3,20 @@
 [![CI](https://github.com/crgeee/gh-runner-status/actions/workflows/ci.yml/badge.svg)](https://github.com/crgeee/gh-runner-status/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A `gh` CLI extension that gives you a single view of self-hosted GitHub Actions runners across multiple repos — and lets you start, stop, restart, and tail logs of the ones running on the local machine. Optional Telegram alerts when something goes offline.
+A `gh` CLI extension that gives you a single view of self-hosted GitHub Actions runners across multiple repos — and lets you start, stop, restart, tail logs of the ones running on the local machine, and get a Telegram ping when something goes offline. Optional auto-refresh "watch" mode and a Claude-Code-style REPL.
 
 ```
 $ gh runner-status
 
-REPO            NAME        STATUS   BUSY  LABELS
---------------------------------------------------
-your-org/api    runner-1    online   no    self-hosted,linux,x64
-your-org/api    runner-2    online   yes   self-hosted,linux,x64
-your-org/web    runner-1    offline  no    self-hosted,linux,x64
-your-org/data   runner-1    online   no    self-hosted,macOS,ARM64
+  REPO            NAME        STATUS   BUSY  LABELS
+-----------------------------------------------------
+✓ your-org/api    runner-1    online   no    self-hosted,linux,x64
+✓ your-org/api    runner-2    online   yes   self-hosted,linux,x64
+✗ your-org/web    runner-1    offline  no    self-hosted,linux,x64
+✓ your-org/data   runner-1    online   no    self-hosted,macOS,ARM64
 ```
 
-`STATUS` is colorized green (online), red (offline), yellow (error) when stdout is a TTY.
+`STATUS` is colorized green (online), red (offline), yellow (error) when stdout is a TTY. Status icons (`✓`/`✗`/`⚠`) can be disabled with `NO_ICONS=1`.
 
 ## Why
 
@@ -77,6 +77,46 @@ gh runner-status logs    actions.runner.org-repo.name
 ```
 
 The runner name is the LaunchAgent label on macOS (`actions.runner.OWNER-REPO.NAME`) or the systemd service name on Linux. `gh runner-status local` shows you the names.
+
+### Watch mode
+
+Refresh the table on an interval — useful while a deploy is in flight, or when you want a permanent terminal pane showing fleet health.
+
+```bash
+gh runner-status watch                          # 30s refresh (default)
+gh runner-status watch 5                        # 5s refresh
+gh runner-status watch 60 your-org/api          # specific repos only
+```
+
+`Ctrl-C` to exit.
+
+### Interactive REPL
+
+Run `gh runner-status` with no args (in a terminal) and you drop into a persistent prompt with slash commands and short aliases — same UX as Claude Code.
+
+```
+▸ gh-runner-status v0.2.0
+type /help for commands • Ctrl-D to exit
+
+❯ list
+  REPO            NAME        STATUS   BUSY  LABELS
+-----------------------------------------------------
+✓ your-org/api    runner-1    online   no    self-hosted,linux,x64
+✗ your-org/web    runner-1    offline  no    self-hosted,linux,x64
+
+❯ restart actions.runner.your-org-web.runner-1
+restarted: actions.runner.your-org-web.runner-1
+
+❯ /repos
+# /home/you/.config/gh-runner-status/repos
+your-org/api
+your-org/web
+
+❯ /quit
+bye!
+```
+
+Aliases inside the REPL: `l`/`ls` → `list`, `r` → `restart`, `s` → `start`, `x` → `stop`, `n` → `notify`, `w` → `watch`. Up-arrow recalls history within the session.
 
 ### Telegram alerts
 
