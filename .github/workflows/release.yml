@@ -1,0 +1,26 @@
+name: Release
+
+# release-please watches master for Conventional Commit messages
+# (feat:, fix:, feat!: for breaking) and maintains a single
+# "release PR" that bumps the version + updates CHANGELOG. Merging
+# that PR tags the commit and creates a GitHub release.
+#
+# This workflow does not consume any user-controlled input
+# (no event titles, bodies, refs interpolated into run: blocks),
+# so it is workflow-injection-safe by construction.
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          target-branch: master

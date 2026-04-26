@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0" # x-release-please-version
 
 tmpdir=""
 trap 'rm -rf "${tmpdir:-}"' EXIT
@@ -138,9 +138,17 @@ read_config() {
   if [[ ! -f "$file" ]]; then
     echo "error: config file not found: $file" >&2
     echo "create it with one 'owner/repo' per line, or pass repos as arguments" >&2
-    exit 1
+    return 1
   fi
-  # strip comments (# to end-of-line) and blank lines
+  sed 's/#.*//' "$file" | awk 'NF > 0 { print $1 }'
+}
+
+# Variant that returns 0 with empty output when the file is missing,
+# so callers (REPL dashboard, stats) can decide how to surface "no
+# config yet" without the harder exit-1 contract.
+read_config_optional() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
   sed 's/#.*//' "$file" | awk 'NF > 0 { print $1 }'
 }
 
@@ -226,13 +234,22 @@ enrich_with_local_metrics() {
       echo "$line"
       continue
     fi
+    # LaunchAgent exists for this runner — it's local. Mark it as such
+    # so `stats` counts it correctly even when stopped.
     pid=$(local_runner_pid "$match")
     if [[ -z "$pid" ]]; then
-      echo "$line"
+      jq -c '. + {local: true, cpu_pct: null, rss_kb: null, jobs_active: null}' <<<"$line"
       continue
     fi
     metrics=$(local_runner_metrics_for_pid "$pid")
     IFS='|' read -r _ cpu rss jobs <<<"$metrics"
+    # Defensive: if ps emitted nothing (process exited between PID
+    # lookup and sampling), all metric fields will be empty. Treat as
+    # null instead of fabricating zeros that read as "running but idle".
+    if [[ -z "$cpu" && -z "$rss" ]]; then
+      jq -c '. + {local: true, cpu_pct: null, rss_kb: null, jobs_active: null}' <<<"$line"
+      continue
+    fi
     jq -c --arg cpu "${cpu:-}" --arg rss "${rss:-}" --arg jobs "${jobs:-0}" \
       '. + {cpu_pct: ($cpu | tonumber? // null),
             rss_kb: ($rss | tonumber? // null),
@@ -283,44 +300,28 @@ render_table() {
   local icons_enabled=1
   [[ "${NO_ICONS:-0}" == "1" ]] && icons_enabled=0
 
-  # Pre-format CPU%, MEM, JOBS via shell so awk can do simple width math.
-  # Empty/null fields render as "-" so remote (non-local) runners read
-  # cleanly. Local runners that happen to be down also get "-".
-  local prepared
-  prepared=$(while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    local repo name status busy labels cpu rss cpu_p rss_p
-    repo=$(jq -r '.repo // "?"' <<<"$line")
-    name=$(jq -r '.name // .error // "?"' <<<"$line")
-    status=$(jq -r '.status // "error"' <<<"$line")
-    busy=$(jq -r 'if .busy == true then "yes" elif .busy == false then "no" else "-" end' <<<"$line")
-    labels=$(jq -r 'if .labels then (.labels | join(",")) else "-" end' <<<"$line")
-    cpu=$(jq -r '.cpu_pct // ""' <<<"$line")
-    rss=$(jq -r '.rss_kb // ""' <<<"$line")
-    if [[ -n "$cpu" ]]; then
-      cpu_p="${cpu}%"
-    else
-      cpu_p="-"
-    fi
-    if [[ -n "$rss" ]]; then
-      rss_p=$(fmt_rss "$rss")
-    else
-      rss_p="-"
-    fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$repo" "$name" "$status" "$busy" "$cpu_p" "$rss_p" "$labels"
-  done <<<"$rows")
-
-  printf '%s\n' "$prepared" | awk -F'\t' -v color="$color_enabled" -v icons="$icons_enabled" '
+  # Single jq pass projects each row into TAB-delimited columns; awk
+  # handles width measurement, color, and MEM formatting in one stream.
+  # Avoids spawning ~7 jq processes per runner (the previous per-row
+  # extraction approach reintroduced the high process-spawn overhead
+  # this pipeline was originally designed to avoid).
+  jq -rs '.[] |
+    [
+      (.repo // "?"),
+      (.name // .error // "?"),
+      (.status // "error"),
+      (if .busy == true then "yes" elif .busy == false then "no" else "-" end),
+      (if .cpu_pct != null then ((.cpu_pct | tostring) + "%") else "-" end),
+      (.rss_kb // ""),
+      (if .labels then (.labels | join(",")) else "-" end)
+    ] | @tsv' <<<"$rows" \
+  | awk -F'\t' -v color="$color_enabled" -v icons="$icons_enabled" '
     BEGIN { wr=4; wn=4; ws=6; wb=4; wc=3; wm=3 }
-    NF < 7 { next }
-    {
-      lines[NR] = $0
-      if (length($1) > wr) wr = length($1)
-      if (length($2) > wn) wn = length($2)
-      if (length($3) > ws) ws = length($3)
-      if (length($4) > wb) wb = length($4)
-      if (length($5) > wc) wc = length($5)
-      if (length($6) > wm) wm = length($6)
+    function fmt_kb(kb) {
+      if (kb == "" || kb == 0) return "-"
+      if (kb >= 1048576) return sprintf("%.1fG", kb/1048576)
+      if (kb >= 1024)    return sprintf("%dM", kb/1024)
+      return sprintf("%dK", kb)
     }
     function icon_for(status) {
       if (!icons) return ""
@@ -328,6 +329,18 @@ render_table() {
       if (status == "offline") return "✗"
       if (status == "error")   return "⚠"
       return "•"
+    }
+    NF < 7 { next }
+    {
+      $6 = fmt_kb($6)
+      $0 = $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7
+      lines[NR] = $0
+      if (length($1) > wr) wr = length($1)
+      if (length($2) > wn) wn = length($2)
+      if (length($3) > ws) ws = length($3)
+      if (length($4) > wb) wb = length($4)
+      if (length($5) > wc) wc = length($5)
+      if (length($6) > wm) wm = length($6)
     }
     END {
       hdr_icon = icons ? "  " : ""
@@ -511,10 +524,16 @@ local_runner_metrics_for_pid() {
 
   # ps -o ...= suppresses the header. -p accepts a comma-separated PID
   # list on both macOS BSD ps and Linux GNU ps.
+  # If ps prints nothing (process exited between PID lookup and now),
+  # emit empty fields so callers can render `-` instead of fabricating
+  # 0.0%/0K which reads as "running but idle".
   ps -o etime=,pcpu=,rss= -p "$pid_list" 2>/dev/null | awk -v jobs="$jobs" '
-    NR == 1 { etime = $1 }   # use the root process etime as the runner uptime
+    NR == 1 { etime = $1 }
     { cpu += $2; rss += $3 }
-    END { printf "%s|%.1f|%d|%d", etime, cpu, rss, jobs }
+    END {
+      if (NR == 0) print "|||"
+      else printf "%s|%.1f|%d|%d", etime, cpu, rss, jobs
+    }
   '
 }
 
@@ -914,11 +933,12 @@ dispatch_subcommand() {
     stats)
       # Aggregate fleet stats from the API + local-process metrics.
       # Useful "is the fleet healthy at a glance" view distinct from the
-      # per-runner status table.
+      # per-runner status table. Uses read_config_optional so missing
+      # config returns a clean error instead of `exit 1`-ing the REPL.
       local repos=()
       while IFS= read -r r; do
         [[ -n "$r" ]] && repos+=("$r")
-      done < <(read_config "${CONFIG_FILE:-$(config_path)}" 2>/dev/null || true)
+      done < <(read_config_optional "${CONFIG_FILE:-$(config_path)}")
       if [[ ${#repos[@]} -eq 0 ]]; then
         echo "no repos configured (run \`add OWNER/REPO\` first)" >&2
         return 1
@@ -934,7 +954,6 @@ dispatch_subcommand() {
       # Compute aggregates in one jq pass.
       local agg
       agg=$(jq -rs '
-        def to_pct(x; total): if total == 0 then 0 else (x / total * 100) end;
         {
           total:    length,
           online:   ([.[] | select(.status == "online")]  | length),

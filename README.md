@@ -34,6 +34,8 @@ That's it.
 gh extension upgrade gh-runner-status
 ```
 
+Releases are automated via [release-please](https://github.com/googleapis/release-please) — Conventional Commits on `master` trigger version bumps and GitHub releases automatically. Check the [latest release](https://github.com/crgeee/gh-runner-status/releases) for what's new.
+
 **Uninstall:**
 
 ```bash

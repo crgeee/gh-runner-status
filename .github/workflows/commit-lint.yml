@@ -1,0 +1,38 @@
+name: Commit Lint
+
+# Validates PR titles as Conventional Commits. We squash-merge, so the
+# squash commit message becomes the PR title — getting the title right
+# is what matters for release-please.
+#
+# This workflow does not interpolate any user-controlled input into
+# run blocks. The action reads the PR title via the pull_request event
+# context internally and never echoes it to a shell.
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  validate-pr-title:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            chore
+            test
+            refactor
+            review
+            ci
+            perf
+            build
+            revert
+          requireScope: false
