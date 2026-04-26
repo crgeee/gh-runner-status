@@ -263,9 +263,31 @@ A bad repo doesn't crash the run — its row appears with the error inline.
 
 ## Local runner control
 
+Use the **short name** you see in the table — no need to type the full LaunchAgent label:
+
+```bash
+gh runner-status start   runner-1     # short name auto-resolved
+gh runner-status restart runner-1
+gh runner-status stop    runner-1
+gh runner-status logs    runner-1
+```
+
+If a short name is ambiguous (two repos both have a `runner-1`), the command lists the matches and asks you to use the full label. Full labels still work too.
+
 `start`/`stop`/`restart`/`logs` target:
 - **macOS** — LaunchAgents at `~/Library/LaunchAgents/actions.runner.*.plist` (the path GitHub's installer uses)
 - **Linux** — `systemd` user services or system services named `actions.runner.*.service`
+
+## Shell autocomplete
+
+```bash
+echo 'source ~/.local/share/gh/extensions/gh-runner-status/completions/gh-runner-status.bash' >> ~/.bashrc
+```
+
+Tab-completes:
+- subcommands (`gh runner-status <TAB>` → `list local start stop ...`)
+- runner short names for `start/stop/restart/logs` (reads installed LaunchAgents/systemd units)
+- configured repos for `list/add/remove`
 
 ## Security
 
