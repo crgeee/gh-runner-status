@@ -724,6 +724,18 @@ dispatch_subcommand() {
         done < <(list_local_runners)
         echo "]"
       else
+        # Capture list_local_runners output AND its exit code so we can
+        # distinguish "no runners installed" (exit 0, empty output) from
+        # "this OS isn't supported" (exit 1) instead of conflating them
+        # under a misleading "(no local runners found)" hint.
+        local raw rc
+        raw=$(list_local_runners 2>&1)
+        rc=$?
+        if [[ $rc -ne 0 ]]; then
+          echo "$raw" >&2
+          return $rc
+        fi
+
         local rows=()
         while IFS= read -r r; do
           [[ -z "$r" ]] && continue
@@ -740,7 +752,7 @@ dispatch_subcommand() {
             state="stopped"; pid="-"; etime_pretty="-"; rss_pretty="-"; cpu_pretty="-"
           fi
           rows+=("$state|$r|${pid}|$etime_pretty|$cpu_pretty|$rss_pretty")
-        done < <(list_local_runners)
+        done <<<"$raw"
 
         if [[ ${#rows[@]} -eq 0 ]]; then
           echo "(no local runners found)"
