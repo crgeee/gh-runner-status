@@ -237,23 +237,38 @@ enrich_with_local_metrics() {
     # LaunchAgent exists for this runner — it's local. Mark it as such
     # so `stats` counts it correctly even when stopped.
     pid=$(local_runner_pid "$match")
+    local version v_status
+    version=$(local_runner_version "$match")
+    v_status=$(runner_version_status "$version")
     if [[ -z "$pid" ]]; then
-      jq -c '. + {local: true, cpu_pct: null, rss_kb: null, jobs_active: null}' <<<"$line"
+      jq -c --arg ver "${version:-}" --arg vs "$v_status" \
+        '. + {local: true, cpu_pct: null, rss_kb: null, jobs_active: null,
+              etime: null, runner_version: ($ver | select(. != "")),
+              version_status: $vs}' \
+        <<<"$line"
       continue
     fi
     metrics=$(local_runner_metrics_for_pid "$pid")
-    IFS='|' read -r _ cpu rss jobs <<<"$metrics"
+    local etime
+    IFS='|' read -r etime cpu rss jobs <<<"$metrics"
     # Defensive: if ps emitted nothing (process exited between PID
-    # lookup and sampling), all metric fields will be empty. Treat as
-    # null instead of fabricating zeros that read as "running but idle".
+    # lookup and sampling), all metric fields will be empty.
     if [[ -z "$cpu" && -z "$rss" ]]; then
-      jq -c '. + {local: true, cpu_pct: null, rss_kb: null, jobs_active: null}' <<<"$line"
+      jq -c --arg ver "${version:-}" --arg vs "$v_status" \
+        '. + {local: true, cpu_pct: null, rss_kb: null, jobs_active: null,
+              etime: null, runner_version: ($ver | select(. != "")),
+              version_status: $vs}' \
+        <<<"$line"
       continue
     fi
     jq -c --arg cpu "${cpu:-}" --arg rss "${rss:-}" --arg jobs "${jobs:-0}" \
+          --arg etime "${etime:-}" --arg ver "${version:-}" --arg vs "$v_status" \
       '. + {cpu_pct: ($cpu | tonumber? // null),
             rss_kb: ($rss | tonumber? // null),
             jobs_active: ($jobs | tonumber? // 0),
+            etime: ($etime | select(. != "")),
+            runner_version: ($ver | select(. != "")),
+            version_status: $vs,
             local: true}' \
       <<<"$line"
   done
@@ -301,27 +316,47 @@ render_table() {
   [[ "${NO_ICONS:-0}" == "1" ]] && icons_enabled=0
 
   # Single jq pass projects each row into TAB-delimited columns; awk
-  # handles width measurement, color, and MEM formatting in one stream.
-  # Avoids spawning ~7 jq processes per runner (the previous per-row
-  # extraction approach reintroduced the high process-spawn overhead
-  # this pipeline was originally designed to avoid).
+  # handles width measurement, color, and MEM/UPTIME formatting in
+  # one stream. Avoids per-row jq spawns.
   jq -rs '.[] |
     [
       (.repo // "?"),
       (.name // .error // "?"),
       (.status // "error"),
       (if .busy == true then "yes" elif .busy == false then "no" else "-" end),
+      (.etime // ""),
       (if .cpu_pct != null then ((.cpu_pct | tostring) + "%") else "-" end),
       (.rss_kb // ""),
+      (.runner_version // ""),
+      (.version_status // ""),
       (if .labels then (.labels | join(",")) else "-" end)
     ] | @tsv' <<<"$rows" \
   | awk -F'\t' -v color="$color_enabled" -v icons="$icons_enabled" '
-    BEGIN { wr=4; wn=4; ws=6; wb=4; wc=3; wm=3 }
+    BEGIN { wr=4; wn=4; ws=6; wb=4; wu=6; wc=3; wm=3; wv=7 }
     function fmt_kb(kb) {
       if (kb == "" || kb == 0) return "-"
       if (kb >= 1048576) return sprintf("%.1fG", kb/1048576)
       if (kb >= 1024)    return sprintf("%dM", kb/1024)
       return sprintf("%dK", kb)
+    }
+    # Compress ps etime ("D-HH:MM:SS" / "HH:MM:SS" / "MM:SS") to
+    # human-friendly "5d 2h" / "2h 30m" / "12m".
+    function fmt_etime(t) {
+      if (t == "") return "-"
+      if (split(t, a, "-") == 2) { d = a[1]; rest = a[2] }
+      else                       { d = 0;    rest = t }
+      n = split(rest, b, ":")
+      if (n == 3) { h = b[1]; m = b[2] }
+      else if (n == 2) { h = 0; m = b[1] }
+      else { h = 0; m = 0 }
+      if (d + 0 > 0)  return sprintf("%dd %dh", d, h)
+      if (h + 0 > 0)  return sprintf("%dh %dm", h, m)
+      return sprintf("%dm", m)
+    }
+    function fmt_version(v, vs) {
+      if (v == "") return "-"
+      if (vs == "outdated") return v "*"
+      return v
     }
     function icon_for(status) {
       if (!icons) return ""
@@ -330,24 +365,27 @@ render_table() {
       if (status == "error")   return "⚠"
       return "•"
     }
-    NF < 7 { next }
+    NF < 10 { next }
     {
-      $6 = fmt_kb($6)
-      $0 = $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7
-      lines[NR] = $0
+      $5 = fmt_etime($5)
+      $7 = fmt_kb($7)
+      $8 = fmt_version($8, $9)
+      lines[NR] = $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7 "\t" $8 "\t" $10
       if (length($1) > wr) wr = length($1)
       if (length($2) > wn) wn = length($2)
       if (length($3) > ws) ws = length($3)
       if (length($4) > wb) wb = length($4)
-      if (length($5) > wc) wc = length($5)
-      if (length($6) > wm) wm = length($6)
+      if (length($5) > wu) wu = length($5)
+      if (length($6) > wc) wc = length($6)
+      if (length($7) > wm) wm = length($7)
+      if (length($8) > wv) wv = length($8)
     }
     END {
       hdr_icon = icons ? "  " : ""
-      printf "%s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s\n", \
+      printf "%s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s\n", \
         hdr_icon, wr, "REPO", wn, "NAME", ws, "STATUS", wb, "BUSY", \
-        wc, "CPU", wm, "MEM", "LABELS"
-      total = (icons ? 4 : 0) + wr + wn + ws + wb + wc + wm + 22
+        wu, "UPTIME", wc, "CPU", wm, "MEM", wv, "VERSION", "LABELS"
+      total = (icons ? 4 : 0) + wr + wn + ws + wb + wu + wc + wm + wv + 26
       for (i = 0; i < total; i++) printf "-"
       printf "\n"
       for (i = 1; i <= NR; i++) {
@@ -361,9 +399,9 @@ render_table() {
         }
         ic = icon_for(f[3])
         if (icons) printf "%s%s ", c, ic
-        printf "%s%-*s%s  %-*s  %s%-*s%s  %-*s  %-*s  %-*s  %s\n", \
+        printf "%s%-*s%s  %-*s  %s%-*s%s  %-*s  %-*s  %-*s  %-*s  %-*s  %s\n", \
           (icons ? r : ""), wr, f[1], "", wn, f[2], c, ws, f[3], r, \
-          wb, f[4], wc, f[5], wm, f[6], f[7]
+          wb, f[4], wu, f[5], wc, f[6], wm, f[7], wv, f[8], f[9]
       }
     }'
 }
@@ -483,6 +521,88 @@ local_runner_pid() {
       echo ""
       ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# Runner version detection + GitHub Releases lookup
+# ---------------------------------------------------------------------------
+
+# Find the install directory for a given LaunchAgent label / systemd
+# unit by reading WorkingDirectory from the service definition.
+local_runner_install_dir() {
+  local name="$1"
+  validate_runner_name "$name" >/dev/null 2>&1 || { echo ""; return 0; }
+  local os
+  os=$(detect_os)
+  case "$os" in
+    macos)
+      local plist="$HOME/Library/LaunchAgents/${name}.plist"
+      [[ -f "$plist" ]] || { echo ""; return 0; }
+      plutil -extract WorkingDirectory raw -o - "$plist" 2>/dev/null || echo ""
+      ;;
+    linux)
+      systemctl --user show -P WorkingDirectory "$name" 2>/dev/null \
+        || systemctl show -P WorkingDirectory "$name" 2>/dev/null \
+        || echo ""
+      ;;
+    *) echo "" ;;
+  esac
+}
+
+# Read the installed Actions Runner version from the bin.X.Y.Z/
+# directories the runner installer leaves in place. Highest-versioned
+# dir is the active install. This avoids spawning Runner.Listener
+# (~30ms per call) — important for dashboards refreshing every 30s
+# across N runners.
+local_runner_version() {
+  local name="$1"
+  local dir
+  dir=$(local_runner_install_dir "$name")
+  [[ -z "$dir" ]] && { echo ""; return 0; }
+  # Match `bin.<digits>.<digits>.<digits>` exactly; fall through to
+  # nothing if no versioned dir exists (some installs have only `bin/`).
+  find "$dir" -maxdepth 1 -type d -name 'bin.[0-9]*.[0-9]*.[0-9]*' 2>/dev/null \
+    | sort -t. -k2,2n -k3,3n -k4,4n \
+    | tail -1 \
+    | sed 's|.*/bin\.||'
+}
+
+# Latest Actions Runner release. Cached in $TMPDIR for an hour so the
+# dashboard doesn't hit the API every refresh. Returns "" on failure.
+latest_runner_version() {
+  local cache="${TMPDIR:-/tmp}/gh-runner-status.latest_runner_version"
+  if [[ -f "$cache" ]]; then
+    local mtime now age
+    mtime=$(stat -f %m "$cache" 2>/dev/null || stat -c %Y "$cache" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    age=$(( now - mtime ))
+    if (( age < 3600 )); then
+      cat "$cache"
+      return 0
+    fi
+  fi
+  local v
+  v=$(gh api repos/actions/runner/releases/latest --jq .tag_name 2>/dev/null | sed 's/^v//')
+  if [[ -n "$v" ]]; then
+    echo "$v" >"$cache"
+    echo "$v"
+  elif [[ -f "$cache" ]]; then
+    cat "$cache"   # stale-but-better-than-nothing
+  fi
+}
+
+# Return "ok"|"outdated"|"unknown" by comparing installed vs latest.
+runner_version_status() {
+  local installed="$1"
+  local latest
+  latest=$(latest_runner_version)
+  if [[ -z "$installed" || -z "$latest" ]]; then
+    echo "unknown"
+  elif [[ "$installed" == "$latest" ]]; then
+    echo "ok"
+  else
+    echo "outdated"
+  fi
 }
 
 # Walk a PID and all its descendants, returning a space-separated list
@@ -1076,6 +1196,211 @@ dispatch_subcommand() {
       jq -r '.oses[] | "  \(.count)x \(.os)"' <<<"$agg"
       ;;
 
+    info)
+      # `info NAME` — detailed view of one runner. Combines API data
+      # (status, busy, labels) with local introspection (PID, uptime,
+      # CPU, MEM, version, install dir).
+      if [[ ${#positional[@]} -ne 1 ]]; then
+        echo "error: info requires exactly one runner name" >&2
+        return 2
+      fi
+      local target="${positional[0]}"
+      local label
+      label=$(_resolve_runner_label "$target") || return $?
+      validate_runner_name "$label" || return 1
+      local short_name="${label##*.}"
+      local pid version v_status install_dir
+      pid=$(local_runner_pid "$label")
+      install_dir=$(local_runner_install_dir "$label")
+      version=$(local_runner_version "$label")
+      v_status=$(runner_version_status "$version")
+      local latest
+      latest=$(latest_runner_version)
+
+      echo "Runner: $short_name"
+      echo "  Label:        $label"
+      echo "  Install dir:  ${install_dir:-?}"
+      echo "  PID:          ${pid:--}"
+      if [[ -n "$pid" ]]; then
+        local metrics etime cpu rss jobs
+        metrics=$(local_runner_metrics_for_pid "$pid")
+        IFS='|' read -r etime cpu rss jobs <<<"$metrics"
+        echo "  Uptime:       $(fmt_etime "${etime:-}")"
+        echo "  CPU:          ${cpu:--}%"
+        echo "  Memory:       $(fmt_rss "${rss:-}")"
+        echo "  Active jobs:  ${jobs:-0}"
+      fi
+      echo "  Version:      ${version:-?} ($v_status)"
+      [[ -n "$latest" ]] && echo "  Latest:       $latest"
+      ;;
+
+    update)
+      # `update [--check] NAME` — show or apply a runner version upgrade.
+      # Without --check, executes the upgrade: stop runner, download
+      # latest tarball, extract over install dir, restart runner.
+      # `--check` is non-destructive — just reports installed vs latest.
+      local check_only=0
+      local target=""
+      for arg in ${positional[@]:+"${positional[@]}"}; do
+        case "$arg" in
+          --check) check_only=1 ;;
+          *) target="$arg" ;;
+        esac
+      done
+
+      if [[ -z "$target" ]]; then
+        # No name → check ALL local runners
+        local raw rc
+        raw=$(list_local_runners 2>&1)
+        rc=$?
+        if [[ $rc -ne 0 ]]; then echo "$raw" >&2; return $rc; fi
+        local any_outdated=0
+        local latest
+        latest=$(latest_runner_version)
+        echo "Checking ${latest:+latest=$latest, }installed runners:"
+        echo
+        while IFS= read -r r; do
+          [[ -z "$r" ]] && continue
+          local v vs
+          v=$(local_runner_version "$r")
+          vs=$(runner_version_status "$v")
+          local marker=""
+          case "$vs" in
+            outdated) marker="⚠ outdated"; any_outdated=1 ;;
+            ok)       marker="✓ up-to-date" ;;
+            *)        marker="? unknown" ;;
+          esac
+          printf '  %-50s  %-10s  %s\n' "$r" "${v:-?}" "$marker"
+        done <<<"$raw"
+        echo
+        if [[ $any_outdated -eq 1 ]]; then
+          echo "To upgrade an outdated runner: gh runner-status update <name>"
+          return 0
+        fi
+        return 0
+      fi
+
+      local label
+      label=$(_resolve_runner_label "$target") || return $?
+      validate_runner_name "$label" || return 1
+      local install_dir current latest
+      install_dir=$(local_runner_install_dir "$label")
+      [[ -z "$install_dir" ]] && {
+        echo "error: cannot find install dir for $label" >&2
+        return 1
+      }
+      current=$(local_runner_version "$label")
+      latest=$(latest_runner_version)
+      if [[ -z "$latest" ]]; then
+        echo "error: could not determine latest runner version (network?)" >&2
+        return 1
+      fi
+      if [[ "$current" == "$latest" ]]; then
+        echo "$label is already at $current (latest)."
+        return 0
+      fi
+
+      echo "Upgrade plan for $label:"
+      echo "  Install dir:  $install_dir"
+      echo "  Current:      ${current:-?}"
+      echo "  Latest:       $latest"
+
+      if [[ $check_only -eq 1 ]]; then
+        echo "(--check) skipping execution. Drop --check to apply."
+        return 0
+      fi
+
+      # Detect platform for tarball naming.
+      local os arch tarname
+      case "$(uname -s)" in
+        Darwin) os="osx" ;;
+        Linux)  os="linux" ;;
+        *) echo "error: update not supported on $(uname -s)" >&2; return 1 ;;
+      esac
+      case "$(uname -m)" in
+        arm64|aarch64) arch="arm64" ;;
+        x86_64)        arch="x64" ;;
+        *) echo "error: update not supported on $(uname -m)" >&2; return 1 ;;
+      esac
+      tarname="actions-runner-${os}-${arch}-${latest}.tar.gz"
+      local url="https://github.com/actions/runner/releases/download/v${latest}/${tarname}"
+
+      echo
+      echo "Stopping $label..."
+      local_runner_action stop "$label" 2>/dev/null || true
+      sleep 1
+
+      local tmpdir
+      tmpdir=$(mktemp -d)
+      echo "Downloading $tarname..."
+      if ! curl -fsSL "$url" -o "$tmpdir/runner.tgz"; then
+        echo "error: download failed" >&2
+        rm -rf "$tmpdir"
+        # Try to restart anyway
+        local_runner_action start "$label" 2>/dev/null || true
+        return 1
+      fi
+
+      echo "Extracting into $install_dir..."
+      tar -xzf "$tmpdir/runner.tgz" -C "$install_dir" || {
+        echo "error: extraction failed; runner may be in inconsistent state." >&2
+        rm -rf "$tmpdir"
+        return 1
+      }
+      rm -rf "$tmpdir"
+
+      echo "Starting $label..."
+      local_runner_action start "$label" || true
+
+      echo "Updated $label to $latest."
+      ;;
+
+    doctor)
+      # Health check for the local fleet.
+      local issues=0
+      local raw rc
+      raw=$(list_local_runners 2>&1)
+      rc=$?
+      if [[ $rc -ne 0 ]]; then echo "$raw" >&2; return $rc; fi
+      local latest
+      latest=$(latest_runner_version)
+      echo "Health check (latest runner version: ${latest:-?})"
+      echo
+      while IFS= read -r r; do
+        [[ -z "$r" ]] && continue
+        local pid version v_status install_dir
+        pid=$(local_runner_pid "$r")
+        install_dir=$(local_runner_install_dir "$r")
+        version=$(local_runner_version "$r")
+        v_status=$(runner_version_status "$version")
+
+        local row_issues=()
+        [[ -z "$pid" ]] && row_issues+=("not running")
+        [[ -z "$install_dir" ]] && row_issues+=("install dir not found")
+        [[ "$v_status" == "outdated" ]] && row_issues+=("outdated ($version, latest $latest)")
+
+        if [[ ${#row_issues[@]} -eq 0 ]]; then
+          printf '  ✓ %s\n' "$r"
+        else
+          issues=$(( issues + ${#row_issues[@]} ))
+          printf '  ✗ %s\n' "$r"
+          for issue in "${row_issues[@]}"; do
+            printf '      - %s\n' "$issue"
+          done
+        fi
+      done <<<"$raw"
+      echo
+      if [[ $issues -eq 0 ]]; then
+        echo "All runners healthy."
+        return 0
+      else
+        echo "$issues issue(s) found across the fleet."
+        echo "Tip: gh runner-status update [<name>]   to upgrade outdated runners"
+        echo "     gh runner-status start <name>     to start stopped runners"
+        return 1
+      fi
+      ;;
+
     add)
       # `add OWNER/REPO [NAME] [LABELS]` — generates a registration token,
       # appends the repo to the config file, prints the exact commands to
@@ -1267,36 +1592,37 @@ EOF
 repl_help() {
   cat <<'EOF'
 Dashboard keys (single keystroke, no Enter):
-  r           Refresh now
-  c           Command mode (one full command, then back to dashboard)
-  /           Slash command
-  a           Add a repo (shortcut to command-mode `add OWNER/REPO`)
+  r           Refresh now (instead of waiting for the timer)
+  c           Command mode — type any command, then [Enter]
+  a           Quick "add OWNER/REPO" — same as c with `add ` pre-filled
   h, ?        This help
   q, Ctrl-D   Quit
 
-Slash commands:
-  /help, /?      Show this help
-  /repos         Show configured repos
-  /clear         Re-render dashboard with fresh state
-  /quit, /exit   Exit
-
-Inline commands (typed in command mode, same shape as the CLI):
+Commands you can type in command mode (`c` then a line):
   list, status         Show runner status table
-  local                List runners on this machine + per-runner metrics
+  local                Runners on this machine + per-runner metrics
   start NAME           Start a local runner
   stop NAME            Stop a local runner
   restart NAME         Restart a local runner
   logs NAME            Tail recent logs
-  watch [SECONDS]      Auto-refresh status table (default 30s)
+  info NAME            Detailed view of one runner
+  update [--check] [NAME]
+                       Upgrade a runner to the latest version. Without
+                       NAME, prints a fleet-wide outdated report.
+  doctor               Health check across all local runners
+  watch [SECONDS]      Auto-refresh interval (default 30s)
   notify               Send Telegram alert if any runner is offline
   add OWNER/REPO       Get registration token + setup instructions
   remove OWNER/REPO N  Deregister a runner from the repo
+  stats                Aggregate fleet view
+  help                 This help
+  quit                 Exit
 
 Aliases: l/ls=list · r=restart · s=start · x=stop · n=notify ·
          w=watch · a=add
 
-Tip: bare `gh runner-status` opens the live dashboard. Pass a
-subcommand for one-shot mode.
+Tip: bare `gh runner-status` opens the dashboard. Pass any subcommand
+to run one-shot from your shell (e.g. `gh runner-status doctor`).
 EOF
 }
 
@@ -1319,9 +1645,9 @@ render_repl_footer() {
   local has_color="$1"
   local refresh="${2:-30}"
   if [[ $has_color -eq 1 ]]; then
-    printf '\033[2m─ refreshing every %ss • \033[0m[r]\033[2mefresh \033[0m[c]\033[2mommand \033[0m[/]\033[2mslash \033[0m[a]\033[2mdd \033[0m[h]\033[2melp \033[0m[q]\033[2muit\033[0m\n' "$refresh"
+    printf '\033[2m─ refreshing every %ss • \033[0m[r]\033[2mefresh \033[0m[c]\033[2mommand \033[0m[a]\033[2mdd \033[0m[h]\033[2melp \033[0m[q]\033[2muit\033[0m\n' "$refresh"
   else
-    printf -- '- refreshing every %ss • [r]efresh [c]ommand [/]slash [a]dd [h]elp [q]uit\n' "$refresh"
+    printf -- '- refreshing every %ss • [r]efresh [c]ommand [a]dd [h]elp [q]uit\n' "$refresh"
   fi
 }
 
@@ -1451,7 +1777,7 @@ handle_repl_line() {
         a)    words[0]="add" ;;
       esac
       case "${words[0]}" in
-        list|status|local|start|stop|restart|logs|notify|watch|add|remove|stats)
+        list|status|local|start|stop|restart|logs|notify|watch|add|remove|stats|update|doctor|info)
           dispatch_subcommand "${words[@]}" || true
           ;;
         *)
@@ -1554,14 +1880,22 @@ dashboard_loop() {
         repl_help
         _pause_for_keypress "$has_color"
         ;;
-      c|C) prompt_and_run "$has_color" ;;          # cache stays warm
-      /)   prompt_and_run "$has_color" "/" ;;
+      c|C) prompt_and_run "$has_color" ;;
       a|A) prompt_and_run "$has_color" "add " ;;
       "")
         # Timeout — refresh cache so the next render shows fresh data.
         _dashboard_refresh_cache
         ;;
-      *) ;; # ignore other keys
+      *)
+        # Brief feedback on unknown keys — better than silent no-op so
+        # the user doesn't think the dashboard is frozen.
+        if [[ $has_color -eq 1 ]]; then
+          printf '\r\033[2m  (unknown key — press [h] for help, [q] to quit)\033[0m'
+        else
+          printf '\r  (unknown key — press [h] for help, [q] to quit)'
+        fi
+        sleep 1
+        ;;
     esac
   done
 
@@ -1635,7 +1969,7 @@ main() {
     subcommand="list"
   else
     case "${args[0]}" in
-      list|status|local|start|stop|restart|logs|notify|watch|add|remove|stats)
+      list|status|local|start|stop|restart|logs|notify|watch|add|remove|stats|update|doctor|info)
         subcommand="${args[0]}"
         positional=("${args[@]:1}")
         ;;
