@@ -37,12 +37,26 @@ jobs:
           set -e
           # Lines containing `bash4-ok` annotation are intentional uses
           # gated behind a bash-version check. Pure-comment lines are
-          # ignored too (we only care about actual code).
+          # ignored too. Scans every shipped bash entrypoint, not just
+          # the main script — completions also need to work on bash 3.2.
+          BASH_SOURCES=(
+            gh-runner-status
+            completions/gh-runner-status.bash
+          )
           scan() {
-            grep -nE "$1" gh-runner-status \
+            # grep -nH emits "path:lineno:content"; awk drops lines
+            # where content (everything after the second `:`) is just
+            # a comment. Bash4-ok annotated lines are also dropped.
+            grep -nHE "$1" "${BASH_SOURCES[@]}" \
               | grep -v 'bash4-ok' \
-              | grep -vE '^[0-9]+:[[:space:]]*#' \
-              || true
+              | awk -F: '{
+                  s = $0
+                  # strip path:lineno: prefix
+                  sub(/^[^:]*:[0-9]+:/, "", s)
+                  # skip whitespace then check first non-blank char
+                  sub(/^[[:space:]]+/, "", s)
+                  if (substr(s, 1, 1) != "#") print
+                }' || true
           }
           fail=0
           out=$(scan 'read[[:space:]][^|;]*-t[[:space:]]+[0-9]+\.[0-9]')

@@ -32,7 +32,15 @@ fi
 # distinguish lone Esc from escape-sequence prefixes (arrow keys, etc.).
 # Cross-version: 50ms on bash 4+, non-blocking peek on bash 3.2.
 _read_short_peek() {
+  if (( $# != 1 )); then
+    echo "_read_short_peek: expected exactly one variable name (got $#)" >&2
+    return 2
+  fi
   local __varname="$1"
+  if [[ ! "$__varname" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    echo "_read_short_peek: '$__varname' is not a valid bash identifier" >&2
+    return 2
+  fi
   # shellcheck disable=SC2229 # intentional indirection: bash `read` reads into the variable named by $__varname
   if [[ "$BASH_HAS_FRACTIONAL_TIMEOUT" == "1" ]]; then
     read -rsn 2 -t 0.05 "$__varname" 2>/dev/null  # bash4-ok: gated by BASH_HAS_FRACTIONAL_TIMEOUT
