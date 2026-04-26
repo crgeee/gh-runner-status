@@ -12,6 +12,16 @@ file automatically. The "Unreleased" section is what release-please
 will roll into the next tagged release.
 -->
 
+## [0.3.1](https://github.com/crgeee/gh-runner-status/compare/v0.3.0...v0.3.1) (2026-04-26)
+
+
+### Features
+
+* gh-runner-status v0.1.0 ([9f3bf6a](https://github.com/crgeee/gh-runner-status/commit/9f3bf6a54ce7421e066a6c19b33a15b559ef0448))
+* live TUI + add/remove + host and runner metrics ([#3](https://github.com/crgeee/gh-runner-status/issues/3)) ([7333c14](https://github.com/crgeee/gh-runner-status/commit/7333c14aec43d38c7ddfaf18150b817c88fd8ac9))
+* per-runner metrics in main list + stats subcommand + bash 3.2 CI ([#4](https://github.com/crgeee/gh-runner-status/issues/4)) ([b488d38](https://github.com/crgeee/gh-runner-status/commit/b488d38fdb7b0a55d740629ad7bcb5acbb19f7c6))
+* v0.2.0 — subcommands, Telegram alerts, security, tests, CI ([#1](https://github.com/crgeee/gh-runner-status/issues/1)) ([f2935ab](https://github.com/crgeee/gh-runner-status/commit/f2935ab4b4c52ed9bdb23523e97f9e648ac9e07c))
+
 ## [Unreleased]
 
 ## [0.3.0] — 2026-04-26
