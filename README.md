@@ -197,7 +197,7 @@ Drop into cron:
 
 ## Themes
 
-Three themes pick the color palette for the dashboard, table, and prompts:
+Three themes for the dashboard, table, and prompts:
 
 | Theme | When to use |
 |---|---|
@@ -205,12 +205,34 @@ Three themes pick the color palette for the dashboard, table, and prompts:
 | `light` | Light-background terminals — bold blue banner, less dim grey |
 | `neon` | Maximum pop — hot pink banner, bright cyan prompts, vivid greens/reds/oranges |
 
+Three ways to set it, in priority order:
+
 ```bash
+# 1. In the dashboard, press [t] to cycle dark → neon → light → dark
+#    (persists automatically)
+
+# 2. CLI subcommand — persists to settings file
+gh runner-status theme neon
+gh runner-status theme next     # cycle
+
+# 3. Inline env var — wins over the settings file
 GH_RUNNER_STATUS_THEME=neon gh runner-status
-echo 'export GH_RUNNER_STATUS_THEME=neon' >> ~/.zshrc    # make it stick
 ```
 
+Settings file is `~/.config/gh-runner-status/settings` (key=value format).
+
 Status icons (`✓`/`✗`/`⚠`) prefix each row by default. Set `NO_ICONS=1` to disable for ASCII-only environments or log viewers that don't render unicode.
+
+## Debug logging
+
+If the dashboard misbehaves (unexpected exit, refresh stalls, key presses ignored), enable the debug log to capture events:
+
+```bash
+GH_RUNNER_STATUS_DEBUG=1 gh runner-status
+# events go to ~/.local/state/gh-runner-status/debug.log
+```
+
+Logs key presses, EOF events, refresh cycles, theme cycles, and quit transitions. Strip the env var to disable.
 
 ## Shell autocomplete
 

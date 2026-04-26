@@ -16,7 +16,7 @@
 # default — no mapfile/readarray usage).
 
 _gh_runner_status_subcommands() {
-  echo "list status local start stop restart logs watch notify add remove stats --help --version --json --config --threshold"
+  echo "list status local start stop restart logs watch notify add remove stats setup info doctor update theme --help --version --json --config --threshold"
 }
 
 _gh_runner_status_runner_names() {
@@ -49,7 +49,7 @@ _gh_runner_status_complete() {
   local subcmd="" i
   for (( i = 1; i < COMP_CWORD; i++ )); do
     case "${COMP_WORDS[i]}" in
-      list|status|local|start|stop|restart|logs|watch|notify|add|remove|stats)
+      list|status|local|start|stop|restart|logs|watch|notify|add|remove|stats|setup|info|doctor|update|theme)
         subcmd="${COMP_WORDS[i]}"
         break
         ;;
@@ -57,7 +57,13 @@ _gh_runner_status_complete() {
   done
 
   case "$subcmd" in
-    start|stop|restart|logs)
+    theme)
+      # Complete the three theme values + `next`
+      # shellcheck disable=SC2207
+      COMPREPLY=( $(compgen -W "dark light neon next" -- "$cur") )
+      return 0
+      ;;
+    start|stop|restart|logs|info|update)
       local names
       names=$(_gh_runner_status_runner_names)
       # bash-3.2-safe: array-builtin compgen output via word-splitting.
