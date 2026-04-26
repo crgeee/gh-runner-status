@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# gh-runner-status — show status of self-hosted GitHub Actions runners
+# across one or more repos.
+#
+# Usage:
+#   gh runner-status                     # use config file
+#   gh runner-status owner/repo          # single repo
+#   gh runner-status owner/repo[,...]    # multiple repos
+#   gh runner-status --config <file>     # custom config path
+#   gh runner-status --json              # raw JSON output
+#
+# Config file (one repo per line; '#' comments allowed):
+#   $XDG_CONFIG_HOME/gh-runner-status/repos
+#   ~/.config/gh-runner-status/repos     (fallback)
+
+set -euo pipefail
+
+VERSION="0.1.0"
+
+tmpdir=""
+trap 'rm -rf "${tmpdir:-}"' EXIT
+
+usage() {
+  cat <<'EOF'
+gh-runner-status — show self-hosted GitHub Actions runner status
+
+USAGE:
+  gh runner-status [REPOS...] [--config FILE] [--json] [--help]
+
+ARGUMENTS:
+  REPOS    One or more "owner/name" repositories. Comma- or space-
+           separated. If omitted, reads from the config file.
+
+OPTIONS:
+  --config FILE   Read repos from FILE (one per line). Default:
+                  $XDG_CONFIG_HOME/gh-runner-status/repos or
+                  ~/.config/gh-runner-status/repos
+  --json          Print raw JSON instead of the table
+  --help          Show this message
+  --version       Show version
+
+EXAMPLES:
+  gh runner-status
+  gh runner-status crgeee/sepa-screener
+  gh runner-status crgeee/dte0,crgeee/sepa-screener
+  gh runner-status --json | jq '.[] | select(.status == "offline")'
+
+CONFIG FILE FORMAT:
+  # comments are ignored
+  crgeee/sepa-screener
+  crgeee/dte0
+EOF
+}
+
+require() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "error: '$1' is required but not installed" >&2
+    exit 2
+  }
+}
+
+config_path() {
+  local base="${XDG_CONFIG_HOME:-$HOME/.config}"
+  echo "$base/gh-runner-status/repos"
+}
+
+read_config() {
+  local file="$1"
+  if [[ ! -f "$file" ]]; then
+    echo "error: config file not found: $file" >&2
+    echo "create it with one 'owner/repo' per line, or pass repos as arguments" >&2
+    exit 1
+  fi
+  # strip comments (anything from # to end-of-line) and blank lines
+  sed 's/#.*//' "$file" | awk 'NF > 0 { print $1 }'
+}
+
+fetch_runners() {
+  local repo="$1"
+  local response
+  if ! response=$(gh api "repos/${repo}/actions/runners" --paginate 2>&1); then
+    # Surface the error inline so the user sees it in the table; do not
+    # crash the whole run on one bad repo.
+    jq -nc --arg repo "$repo" --arg err "$response" \
+      '{repo: $repo, error: $err}'
+    return
+  fi
+  jq -c --arg repo "$repo" \
+    'if .runners then .runners[] | {repo: $repo, name, status, busy, os, labels: [.labels[].name]}
+     else {repo: $repo, error: "unexpected API response"} end' \
+    <<<"$response"
+}
+
+render_table() {
+  local rows="$1"
+  if [[ -z "$rows" ]]; then
+    echo "(no runners found)"
+    return
+  fi
+
+  # Collect rows, compute column widths, render. Color the status column.
+  local repo_w=4 name_w=4 status_w=6 busy_w=4
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local repo name status busy
+    repo=$(jq -r '.repo // "?"' <<<"$line")
+    name=$(jq -r '.name // .error // "?"' <<<"$line")
+    status=$(jq -r '.status // "error"' <<<"$line")
+    busy=$(jq -r 'if .busy == true then "yes" elif .busy == false then "no" else "-" end' <<<"$line")
+    [[ ${#repo}   -gt $repo_w   ]] && repo_w=${#repo}
+    [[ ${#name}   -gt $name_w   ]] && name_w=${#name}
+    [[ ${#status} -gt $status_w ]] && status_w=${#status}
+    [[ ${#busy}   -gt $busy_w   ]] && busy_w=${#busy}
+  done <<<"$rows"
+
+  printf "%-${repo_w}s  %-${name_w}s  %-${status_w}s  %-${busy_w}s  %s\n" \
+    "REPO" "NAME" "STATUS" "BUSY" "LABELS"
+  printf "%s\n" "$(printf '%*s' $((repo_w + name_w + status_w + busy_w + 20)) '' | tr ' ' '-')"
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local repo name status busy labels color reset
+    repo=$(jq -r '.repo // "?"' <<<"$line")
+    name=$(jq -r '.name // .error // "?"' <<<"$line")
+    status=$(jq -r '.status // "error"' <<<"$line")
+    busy=$(jq -r 'if .busy == true then "yes" elif .busy == false then "no" else "-" end' <<<"$line")
+    labels=$(jq -r 'if .labels then (.labels | join(",")) else "-" end' <<<"$line")
+
+    color=""
+    reset=""
+    if [[ -t 1 ]]; then
+      reset=$'\033[0m'
+      case "$status" in
+        online)  color=$'\033[32m' ;;  # green
+        offline) color=$'\033[31m' ;;  # red
+        error)   color=$'\033[33m' ;;  # yellow
+      esac
+    fi
+
+    printf "%-${repo_w}s  %-${name_w}s  ${color}%-${status_w}s${reset}  %-${busy_w}s  %s\n" \
+      "$repo" "$name" "$status" "$busy" "$labels"
+  done <<<"$rows"
+}
+
+main() {
+  require gh
+  require jq
+
+  local config_file
+  config_file=$(config_path)
+  local json_output=0
+  local repos_arg=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) usage; exit 0 ;;
+      --version) echo "gh-runner-status $VERSION"; exit 0 ;;
+      --json) json_output=1; shift ;;
+      --config) config_file="$2"; shift 2 ;;
+      --config=*) config_file="${1#--config=}"; shift ;;
+      -*) echo "error: unknown option '$1'" >&2; exit 2 ;;
+      *) repos_arg+=("$1"); shift ;;
+    esac
+  done
+
+  local repos=()
+  if [[ ${#repos_arg[@]} -gt 0 ]]; then
+    # Allow comma-separated as well as space-separated. Split each
+    # arg on commas, drop empties.
+    for arg in "${repos_arg[@]}"; do
+      while IFS= read -r r; do
+        [[ -n "$r" ]] && repos+=("$r")
+      done < <(tr ',' '\n' <<<"$arg")
+    done
+  else
+    while IFS= read -r r; do
+      [[ -n "$r" ]] && repos+=("$r")
+    done < <(read_config "$config_file")
+  fi
+
+  if [[ ${#repos[@]} -eq 0 ]]; then
+    echo "error: no repos given (pass as args or populate $config_file)" >&2
+    exit 1
+  fi
+
+  # Fetch in parallel — bg subshells, collect into a single buffer.
+  # tmpdir is set as an env var (not local) so the EXIT trap defined at
+  # top scope can reference it after main returns.
+  tmpdir=$(mktemp -d)
+
+  local i=0
+  for repo in "${repos[@]}"; do
+    fetch_runners "$repo" >"$tmpdir/$i" &
+    i=$((i + 1))
+  done
+  wait
+
+  local all_rows=""
+  for f in "$tmpdir"/*; do
+    [[ -s "$f" ]] || continue
+    all_rows+="$(cat "$f")"$'\n'
+  done
+
+  if [[ $json_output -eq 1 ]]; then
+    if [[ -z "$all_rows" ]]; then
+      echo "[]"
+    else
+      jq -s '.' <<<"$all_rows"
+    fi
+  else
+    render_table "$all_rows"
+  fi
+}
+
+main "$@"
