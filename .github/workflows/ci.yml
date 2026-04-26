@@ -52,13 +52,31 @@ jobs:
     name: Coverage (kcov)
     runs-on: ubuntu-latest
     needs: test
+    # kcov isn't in the default Ubuntu noble repos. Building from source
+    # adds ~3 min to CI. Marked continue-on-error for now so the rest of
+    # CI doesn't block on a flaky coverage step. The branch-protection
+    # required-checks list does NOT include this job.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install kcov + bats + jq
+      - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y kcov bats jq
+          sudo apt-get install -y bats jq cmake binutils-dev libcurl4-openssl-dev \
+            libdw-dev libelf-dev libiberty-dev libssl-dev python3 zlib1g-dev
+
+      - name: Build kcov from source
+        run: |
+          set -euo pipefail
+          KCOV_VERSION="v43"
+          curl -sSL "https://github.com/SimonKagstrom/kcov/archive/refs/tags/${KCOV_VERSION}.tar.gz" \
+            | tar xz
+          cd "kcov-${KCOV_VERSION#v}"
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release >/dev/null
+          make -j"$(nproc)" >/dev/null
+          sudo make install >/dev/null
 
       - name: Run bats under kcov
         run: |
