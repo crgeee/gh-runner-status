@@ -27,6 +27,69 @@ else
   BASH_HAS_FRACTIONAL_TIMEOUT=0
 fi
 
+# Debug log. Enable with GH_RUNNER_STATUS_DEBUG=1 to capture
+# dashboard events (key presses, EOF, refreshes, quit transitions)
+# to $XDG_STATE_HOME/gh-runner-status/debug.log. Useful when the
+# dashboard misbehaves — e.g. exits unexpectedly, refresh stalls.
+DEBUG_LOG_ENABLED="${GH_RUNNER_STATUS_DEBUG:-0}"
+DEBUG_LOG_PATH=""
+if [[ "$DEBUG_LOG_ENABLED" == "1" ]]; then
+  _debug_dir="${XDG_STATE_HOME:-$HOME/.local/state}/gh-runner-status"
+  if mkdir -p "$_debug_dir" 2>/dev/null; then
+    DEBUG_LOG_PATH="$_debug_dir/debug.log"
+  fi
+fi
+
+dlog() {
+  [[ "$DEBUG_LOG_ENABLED" == "1" && -n "$DEBUG_LOG_PATH" ]] || return 0
+  printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >>"$DEBUG_LOG_PATH" 2>/dev/null || true
+}
+
+# User settings file. Persists theme + future preferences across
+# invocations so the user doesn't have to put env vars in .bashrc.
+# Env vars still win over the file (so `GH_RUNNER_STATUS_THEME=neon
+# gh runner-status` always works).
+_settings_path() {
+  echo "${XDG_CONFIG_HOME:-$HOME/.config}/gh-runner-status/settings"
+}
+
+_load_settings() {
+  local cfg
+  cfg=$(_settings_path)
+  [[ -f "$cfg" ]] || return 0
+  # Parse safely: only known keys, no shell sourcing.
+  while IFS='=' read -r key value; do
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    case "$key" in
+      theme)
+        [[ -z "${GH_RUNNER_STATUS_THEME:-}" ]] && export GH_RUNNER_STATUS_THEME="$value"
+        ;;
+      ""|\#*) ;;
+    esac
+  done < <(grep -E '^(theme|#)' "$cfg" 2>/dev/null || true)
+}
+
+_save_setting() {
+  local key="$1" value="$2"
+  local cfg
+  cfg=$(_settings_path)
+  mkdir -p "$(dirname "$cfg")" 2>/dev/null || true
+  local tmp
+  tmp=$(mktemp "${cfg}.XXXXXX") || return 1
+  if [[ -f "$cfg" ]]; then
+    grep -v "^${key}=" "$cfg" >"$tmp" 2>/dev/null || true
+  fi
+  printf '%s=%s\n' "$key" "$value" >>"$tmp"
+  mv -f "$tmp" "$cfg"
+}
+
+# Initialize settings + theme. Settings load first so the env var
+# (set inline by user) can override.
+_load_settings
+
 # Read up to 2 bytes with a short timeout into the named variable.
 # Used to peek for follow-up bytes after reading `\e` so we can
 # distinguish lone Esc from escape-sequence prefixes (arrow keys, etc.).
@@ -1262,6 +1325,35 @@ dispatch_subcommand() {
       jq -r '.oses[] | "  \(.count)x \(.os)"' <<<"$agg"
       ;;
 
+    theme)
+      # `theme [dark|light|neon|next]` — show or set the persistent
+      # theme. Settings file lives at ~/.config/gh-runner-status/settings.
+      if [[ ${#positional[@]} -eq 0 ]]; then
+        echo "current: ${GH_RUNNER_STATUS_THEME:-dark}"
+        echo "available: dark, light, neon"
+        echo "usage: gh runner-status theme dark|light|neon|next"
+        return 0
+      fi
+      local target="${positional[0]}"
+      if [[ "$target" == "next" ]]; then
+        case "${GH_RUNNER_STATUS_THEME:-dark}" in
+          dark)  target="neon" ;;
+          neon)  target="light" ;;
+          light) target="dark" ;;
+          *)     target="dark" ;;
+        esac
+      fi
+      case "$target" in
+        dark|light|neon) ;;
+        *)
+          echo "error: theme must be one of: dark, light, neon, next" >&2
+          return 2 ;;
+      esac
+      _save_setting theme "$target"
+      echo "theme set to: $target"
+      echo "(takes effect on next \`gh runner-status\` invocation)"
+      ;;
+
     setup)
       # `setup OWNER/REPO [--name NAME] [--labels L1,L2] [--dir PATH]`
       # Zero-to-running runner installation. Mints token, downloads
@@ -2064,16 +2156,15 @@ render_repl_footer() {
   local has_color="$1"
   local refresh="${2:-30}"
   if [[ $has_color -eq 1 ]]; then
-    # Each [key] is bright; the label after it is dimmer so the
-    # hotkey itself "pops" without making the whole line shouty.
     printf '%s─ refreshing every %ss • %s' "$THEME_RULE" "$refresh" "$THEME_RESET"
     printf '%s[r]%s%sefresh %s' "$THEME_HOTKEY" "$THEME_RESET" "$THEME_HOTKEY_LBL" "$THEME_RESET"
     printf '%s[c]%s%sommand %s' "$THEME_HOTKEY" "$THEME_RESET" "$THEME_HOTKEY_LBL" "$THEME_RESET"
     printf '%s[a]%s%sdd %s'     "$THEME_HOTKEY" "$THEME_RESET" "$THEME_HOTKEY_LBL" "$THEME_RESET"
+    printf '%s[t]%s%sheme %s'   "$THEME_HOTKEY" "$THEME_RESET" "$THEME_HOTKEY_LBL" "$THEME_RESET"
     printf '%s[h]%s%selp %s'    "$THEME_HOTKEY" "$THEME_RESET" "$THEME_HOTKEY_LBL" "$THEME_RESET"
     printf '%s[q]%s%suit%s\n'   "$THEME_HOTKEY" "$THEME_RESET" "$THEME_HOTKEY_LBL" "$THEME_RESET"
   else
-    printf -- '- refreshing every %ss • [r]efresh [c]ommand [a]dd [h]elp [q]uit\n' "$refresh"
+    printf -- '- refreshing every %ss • [r]efresh [c]ommand [a]dd [t]heme [h]elp [q]uit\n' "$refresh"
   fi
 }
 
@@ -2203,7 +2294,7 @@ handle_repl_line() {
         a)    words[0]="add" ;;
       esac
       case "${words[0]}" in
-        list|status|local|start|stop|restart|logs|notify|watch|add|remove|stats|update|doctor|info|setup)
+        list|status|local|start|stop|restart|logs|notify|watch|add|remove|stats|update|doctor|info|setup|theme)
           dispatch_subcommand "${words[@]}" || true
           ;;
         *)
@@ -2289,6 +2380,9 @@ dashboard_loop() {
   # and quits on a single press.
   local quit_pending_at=0
   local quit_pending_reason=""
+  # One-shot hint when read returns EOF — see the rc=1 branch below.
+  local eof_warned=0
+  dlog "dashboard_loop start refresh=${refresh}s tty_in=$( [[ -t 0 ]] && echo yes || echo no ) tty_out=$( [[ -t 1 ]] && echo yes || echo no )"
 
   trap 'echo; DASHBOARD_QUIT=1' INT
 
@@ -2316,10 +2410,6 @@ dashboard_loop() {
     local age=$(( SECONDS - DASHBOARD_CACHE_AT ))
     local remaining=$(( refresh - age ))
 
-    # If we're at or past the refresh interval, refresh immediately
-    # without reading. Avoids `read -t 0.01` which works on bash 4+
-    # but errors on macOS bash 3.2 ("invalid timeout specification" —
-    # that bash only accepts integer timeouts).
     if (( remaining <= 0 )); then
       _dashboard_refresh_cache
       quit_pending_at=0; quit_pending_reason=""
@@ -2327,17 +2417,36 @@ dashboard_loop() {
     fi
 
     local key="" rc=0
+    local read_started=$SECONDS
     read -rsn 1 -t "$remaining" key
     rc=$?
+    local read_elapsed=$(( SECONDS - read_started ))
 
+    # rc=1 from `read -t` covers BOTH user-pressed-Ctrl-D AND any
+    # stdin glitch (closed pipe, terminal multiplexer reopening fd 0,
+    # etc.). Differentiate by elapsed time: a real Ctrl-D press
+    # arrives quickly, but so does an EOF — so the discriminator is
+    # whether multiple EOFs happen back-to-back without any actual
+    # user interaction. We require a "settling period" between Ctrl-D
+    # presses to count them as confirmation.
     if [[ $rc -eq 1 ]]; then
-      # EOF / Ctrl-D
-      if [[ "$quit_pending_reason" == "Ctrl-D" ]]; then
-        DASHBOARD_QUIT=1
-        continue
+      dlog "read rc=1 (EOF) elapsed=${read_elapsed}s — ignoring (use q or Esc to quit)"
+      # bash `read -t` returns rc=1 on EOF, but EOF can come from
+      # many sources besides a deliberate Ctrl-D press: closed pipe,
+      # terminal multiplexer reattaching, wrapper process churn.
+      # Treating that as "user pressed Ctrl-D" caused spurious
+      # exits after ~60s in some terminals. Don't auto-quit; show
+      # a one-time hint and continue. `q` and Esc still quit.
+      if [[ $eof_warned -ne 1 ]]; then
+        eof_warned=1
+        echo
+        if [[ $has_color -eq 1 ]]; then
+          printf '%s  (stdin glitch; use [q] or Esc to quit cleanly)%s\n' "$THEME_WARN" "$THEME_RESET"
+        else
+          printf '  (stdin glitch; use [q] or Esc to quit cleanly)\n'
+        fi
+        sleep 1
       fi
-      quit_pending_at=$SECONDS
-      quit_pending_reason="Ctrl-D"
       continue
     fi
 
@@ -2379,6 +2488,21 @@ dashboard_loop() {
       a|A)
         quit_pending_at=0; quit_pending_reason=""
         prompt_and_run "$has_color" "add "
+        ;;
+      t|T)
+        # Cycle through themes: dark → neon → light → dark.
+        quit_pending_at=0; quit_pending_reason=""
+        local cur="${GH_RUNNER_STATUS_THEME:-dark}" next=""
+        case "$cur" in
+          dark)  next="neon" ;;
+          neon)  next="light" ;;
+          light) next="dark" ;;
+          *)     next="dark" ;;
+        esac
+        export GH_RUNNER_STATUS_THEME="$next"
+        _theme_init
+        _save_setting theme "$next"
+        dlog "theme cycle: $cur -> $next"
         ;;
       "")
         # Timeout — refresh and clear any pending-quit so the hint
@@ -2469,7 +2593,7 @@ main() {
     subcommand="list"
   else
     case "${args[0]}" in
-      list|status|local|start|stop|restart|logs|notify|watch|add|remove|stats|update|doctor|info|setup)
+      list|status|local|start|stop|restart|logs|notify|watch|add|remove|stats|update|doctor|info|setup|theme)
         subcommand="${args[0]}"
         positional=("${args[@]:1}")
         ;;
