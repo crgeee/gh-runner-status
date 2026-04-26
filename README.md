@@ -30,7 +30,7 @@ GitHub's UI makes you click into each repo's Settings → Actions → Runners pa
 ## Install
 
 ```bash
-gh extension install <owner>/gh-runner-status
+gh extension install crgeee/gh-runner-status
 ```
 
 Upgrade later:
@@ -198,7 +198,7 @@ If you find a security issue, open an issue or PR — happy to credit reporters.
 ## Development
 
 ```bash
-git clone https://github.com/<owner>/gh-runner-status
+git clone https://github.com/crgeee/gh-runner-status
 cd gh-runner-status
 shellcheck gh-runner-status        # lint
 bats tests/                        # 32 tests covering arg parsing,
