@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0" # x-release-please-version
 
 tmpdir=""
 trap 'rm -rf "${tmpdir:-}"' EXIT
@@ -138,9 +138,17 @@ read_config() {
   if [[ ! -f "$file" ]]; then
     echo "error: config file not found: $file" >&2
     echo "create it with one 'owner/repo' per line, or pass repos as arguments" >&2
-    exit 1
+    return 1
   fi
-  # strip comments (# to end-of-line) and blank lines
+  sed 's/#.*//' "$file" | awk 'NF > 0 { print $1 }'
+}
+
+# Variant that returns 0 with empty output when the file is missing,
+# so callers (REPL dashboard, stats) can decide how to surface "no
+# config yet" without the harder exit-1 contract.
+read_config_optional() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
   sed 's/#.*//' "$file" | awk 'NF > 0 { print $1 }'
 }
 
@@ -199,11 +207,63 @@ fetch_runners() {
     <<<"$response"
 }
 
+# Given a row JSON object (from fetch_runners), enrich it with per-runner
+# local metrics if the runner happens to be installed on this machine.
+# Matches by LaunchAgent label `actions.runner.<owner>-<repo>.<name>`.
+# Adds: cpu_pct, rss_kb, jobs_active. Pass-through for unmatched/remote
+# runners (their fields stay null and the table renders "-").
+enrich_with_local_metrics() {
+  local local_runners
+  local_runners=$(list_local_runners 2>/dev/null || true)
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local repo name expected_label match pid metrics cpu rss jobs
+    repo=$(jq -r '.repo // ""' <<<"$line")
+    name=$(jq -r '.name // ""' <<<"$line")
+    if [[ -z "$repo" || -z "$name" ]]; then
+      echo "$line"
+      continue
+    fi
+    expected_label="actions.runner.${repo//\//-}.${name}"
+    match=""
+    if [[ -n "$local_runners" ]]; then
+      match=$(grep -Fx "$expected_label" <<<"$local_runners" 2>/dev/null || true)
+    fi
+    if [[ -z "$match" ]]; then
+      echo "$line"
+      continue
+    fi
+    # LaunchAgent exists for this runner — it's local. Mark it as such
+    # so `stats` counts it correctly even when stopped.
+    pid=$(local_runner_pid "$match")
+    if [[ -z "$pid" ]]; then
+      jq -c '. + {local: true, cpu_pct: null, rss_kb: null, jobs_active: null}' <<<"$line"
+      continue
+    fi
+    metrics=$(local_runner_metrics_for_pid "$pid")
+    IFS='|' read -r _ cpu rss jobs <<<"$metrics"
+    # Defensive: if ps emitted nothing (process exited between PID
+    # lookup and sampling), all metric fields will be empty. Treat as
+    # null instead of fabricating zeros that read as "running but idle".
+    if [[ -z "$cpu" && -z "$rss" ]]; then
+      jq -c '. + {local: true, cpu_pct: null, rss_kb: null, jobs_active: null}' <<<"$line"
+      continue
+    fi
+    jq -c --arg cpu "${cpu:-}" --arg rss "${rss:-}" --arg jobs "${jobs:-0}" \
+      '. + {cpu_pct: ($cpu | tonumber? // null),
+            rss_kb: ($rss | tonumber? // null),
+            jobs_active: ($jobs | tonumber? // 0),
+            local: true}' \
+      <<<"$line"
+  done
+}
+
 collect_remote_runners() {
   # Args: list of repos. Outputs newline-delimited JSON to stdout.
+  # Each row is enriched with per-runner local-process metrics if the
+  # runner happens to be installed on this machine.
   local repos=("$@")
-  # Validate every repo upfront so a bad name fails fast before we
-  # spawn parallel API calls.
   for repo in "${repos[@]}"; do
     validate_repo "$repo" || return 1
   done
@@ -217,8 +277,8 @@ collect_remote_runners() {
   for f in "$tmpdir"/*; do
     [[ -s "$f" ]] || continue
     cat "$f"
-    echo  # ensure trailing newline between files
-  done
+    echo
+  done | enrich_with_local_metrics
 }
 
 render_table() {
@@ -240,22 +300,28 @@ render_table() {
   local icons_enabled=1
   [[ "${NO_ICONS:-0}" == "1" ]] && icons_enabled=0
 
+  # Single jq pass projects each row into TAB-delimited columns; awk
+  # handles width measurement, color, and MEM formatting in one stream.
+  # Avoids spawning ~7 jq processes per runner (the previous per-row
+  # extraction approach reintroduced the high process-spawn overhead
+  # this pipeline was originally designed to avoid).
   jq -rs '.[] |
     [
       (.repo // "?"),
       (.name // .error // "?"),
       (.status // "error"),
       (if .busy == true then "yes" elif .busy == false then "no" else "-" end),
+      (if .cpu_pct != null then ((.cpu_pct | tostring) + "%") else "-" end),
+      (.rss_kb // ""),
       (if .labels then (.labels | join(",")) else "-" end)
     ] | @tsv' <<<"$rows" \
   | awk -F'\t' -v color="$color_enabled" -v icons="$icons_enabled" '
-    BEGIN { wi=2; wr=4; wn=4; ws=6; wb=4 }
-    {
-      lines[NR] = $0
-      if (length($1) > wr) wr = length($1)
-      if (length($2) > wn) wn = length($2)
-      if (length($3) > ws) ws = length($3)
-      if (length($4) > wb) wb = length($4)
+    BEGIN { wr=4; wn=4; ws=6; wb=4; wc=3; wm=3 }
+    function fmt_kb(kb) {
+      if (kb == "" || kb == 0) return "-"
+      if (kb >= 1048576) return sprintf("%.1fG", kb/1048576)
+      if (kb >= 1024)    return sprintf("%dM", kb/1024)
+      return sprintf("%dK", kb)
     }
     function icon_for(status) {
       if (!icons) return ""
@@ -264,10 +330,24 @@ render_table() {
       if (status == "error")   return "⚠"
       return "•"
     }
+    NF < 7 { next }
+    {
+      $6 = fmt_kb($6)
+      $0 = $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7
+      lines[NR] = $0
+      if (length($1) > wr) wr = length($1)
+      if (length($2) > wn) wn = length($2)
+      if (length($3) > ws) ws = length($3)
+      if (length($4) > wb) wb = length($4)
+      if (length($5) > wc) wc = length($5)
+      if (length($6) > wm) wm = length($6)
+    }
     END {
       hdr_icon = icons ? "  " : ""
-      printf "%s%-*s  %-*s  %-*s  %-*s  %s\n", hdr_icon, wr, "REPO", wn, "NAME", ws, "STATUS", wb, "BUSY", "LABELS"
-      total = (icons ? 4 : 0) + wr + wn + ws + wb + 20
+      printf "%s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s\n", \
+        hdr_icon, wr, "REPO", wn, "NAME", ws, "STATUS", wb, "BUSY", \
+        wc, "CPU", wm, "MEM", "LABELS"
+      total = (icons ? 4 : 0) + wr + wn + ws + wb + wc + wm + 22
       for (i = 0; i < total; i++) printf "-"
       printf "\n"
       for (i = 1; i <= NR; i++) {
@@ -281,8 +361,9 @@ render_table() {
         }
         ic = icon_for(f[3])
         if (icons) printf "%s%s ", c, ic
-        printf "%s%-*s%s  %-*s  %s%-*s%s  %-*s  %s\n", \
-          (icons ? r : ""), wr, f[1], "", wn, f[2], c, ws, f[3], r, wb, f[4], f[5]
+        printf "%s%-*s%s  %-*s  %s%-*s%s  %-*s  %-*s  %-*s  %s\n", \
+          (icons ? r : ""), wr, f[1], "", wn, f[2], c, ws, f[3], r, \
+          wb, f[4], wc, f[5], wm, f[6], f[7]
       }
     }'
 }
@@ -404,15 +485,56 @@ local_runner_pid() {
   esac
 }
 
-# Given a PID, return "etime|cpu|rss_kb" via ps. Empty fields on failure.
+# Walk a PID and all its descendants, returning a space-separated list
+# of every PID in the tree. Used so per-runner CPU/MEM totals reflect
+# the whole agent (runsvc.sh wrapper + Runner.Listener node process +
+# any active worker children when a job is running).
+_pids_under() {
+  local root="$1"
+  [[ -z "$root" ]] && return 0
+  echo "$root"
+  local children
+  children=$(pgrep -P "$root" 2>/dev/null || true)
+  [[ -z "$children" ]] && return 0
+  while IFS= read -r c; do
+    [[ -n "$c" ]] && _pids_under "$c"
+  done <<<"$children"
+}
+
+# Given a PID, return "etime|cpu|rss_kb|jobs" summed across the whole
+# process tree (so the wrapper bash + Runner.Listener + workers all
+# get counted). `jobs` is the count of descendants beyond the agent
+# itself — a rough "is this runner doing real work" proxy that
+# complements the GitHub API's `busy` field.
 local_runner_metrics_for_pid() {
   local pid="$1"
-  [[ -z "$pid" ]] && { echo "||"; return 0; }
-  ps -o etime=,pcpu=,rss= -p "$pid" 2>/dev/null \
-    | awk '{
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0);
-        printf "%s|%s|%s", $1, $2, $3
-      }' || echo "||"
+  [[ -z "$pid" ]] && { echo "|||"; return 0; }
+  local pid_list
+  pid_list=$(_pids_under "$pid" | awk 'NF' | paste -sd, -)
+  [[ -z "$pid_list" ]] && { echo "|||"; return 0; }
+
+  # Tree size minus 3 = "active jobs" — the baseline tree is
+  #   runsvc.sh (bash)  →  node runtime  →  Runner.Listener
+  # Anything beyond that is a Runner.Worker handling an actual job
+  # (or the workflow steps spawned by the worker).
+  local tree_size jobs
+  tree_size=$(awk -F, '{print NF}' <<<"$pid_list")
+  jobs=$(( tree_size - 3 ))
+  (( jobs < 0 )) && jobs=0
+
+  # ps -o ...= suppresses the header. -p accepts a comma-separated PID
+  # list on both macOS BSD ps and Linux GNU ps.
+  # If ps prints nothing (process exited between PID lookup and now),
+  # emit empty fields so callers can render `-` instead of fabricating
+  # 0.0%/0K which reads as "running but idle".
+  ps -o etime=,pcpu=,rss= -p "$pid_list" 2>/dev/null | awk -v jobs="$jobs" '
+    NR == 1 { etime = $1 }
+    { cpu += $2; rss += $3 }
+    END {
+      if (NR == 0) print "|||"
+      else printf "%s|%.1f|%d|%d", etime, cpu, rss, jobs
+    }
+  '
 }
 
 # Format kilobyte count as "45M" or "1.2G" for compact display.
@@ -705,22 +827,24 @@ dispatch_subcommand() {
 
     local)
       if [[ "${JSON_OUTPUT:-0}" -eq 1 ]]; then
-        # JSON: include metrics too for scripting/automation
+        # JSON: include tree-summed metrics too for scripting/automation
         local first=1
         echo "["
         while IFS= read -r r; do
           [[ -z "$r" ]] && continue
-          local pid metrics etime cpu rss
+          local pid metrics etime cpu rss jobs
           pid=$(local_runner_pid "$r")
           metrics=$(local_runner_metrics_for_pid "$pid")
-          IFS='|' read -r etime cpu rss <<<"$metrics"
+          IFS='|' read -r etime cpu rss jobs <<<"$metrics"
           [[ $first -eq 0 ]] && echo ","
           first=0
           jq -nc --arg name "$r" --arg pid "${pid:-}" --arg etime "${etime:-}" \
-                 --arg cpu "${cpu:-}" --arg rss_kb "${rss:-}" \
+                 --arg cpu "${cpu:-}" --arg rss_kb "${rss:-}" --arg jobs "${jobs:-0}" \
             '{name: $name, pid: ($pid | select(. != "")), running: ($pid != ""),
-              etime: ($etime | select(. != "")), cpu_pct: ($cpu | select(. != "") | tonumber? // null),
-              rss_kb: ($rss_kb | select(. != "") | tonumber? // null)}'
+              etime: ($etime | select(. != "")),
+              cpu_pct: ($cpu | select(. != "") | tonumber? // null),
+              rss_kb: ($rss_kb | select(. != "") | tonumber? // null),
+              jobs_active: ($jobs | tonumber? // 0)}'
         done < <(list_local_runners)
         echo "]"
       else
@@ -739,19 +863,20 @@ dispatch_subcommand() {
         local rows=()
         while IFS= read -r r; do
           [[ -z "$r" ]] && continue
-          local pid metrics etime cpu rss state etime_pretty rss_pretty cpu_pretty
+          local pid metrics etime cpu rss jobs state etime_pretty rss_pretty cpu_pretty jobs_pretty
           pid=$(local_runner_pid "$r")
           if [[ -n "$pid" ]]; then
             state="running"
             metrics=$(local_runner_metrics_for_pid "$pid")
-            IFS='|' read -r etime cpu rss <<<"$metrics"
+            IFS='|' read -r etime cpu rss jobs <<<"$metrics"
             etime_pretty=$(fmt_etime "${etime:-}")
             rss_pretty=$(fmt_rss "${rss:-}")
             cpu_pretty="${cpu:--}%"
+            jobs_pretty="${jobs:-0}"
           else
-            state="stopped"; pid="-"; etime_pretty="-"; rss_pretty="-"; cpu_pretty="-"
+            state="stopped"; pid="-"; etime_pretty="-"; rss_pretty="-"; cpu_pretty="-"; jobs_pretty="-"
           fi
-          rows+=("$state|$r|${pid}|$etime_pretty|$cpu_pretty|$rss_pretty")
+          rows+=("$state|$r|${pid}|$etime_pretty|$cpu_pretty|$rss_pretty|$jobs_pretty")
         done <<<"$raw"
 
         if [[ ${#rows[@]} -eq 0 ]]; then
@@ -762,16 +887,18 @@ dispatch_subcommand() {
         local color_enabled=0
         [[ -t 1 ]] && color_enabled=1
         printf '%s\n' "${rows[@]}" | awk -F'|' -v color="$color_enabled" '
-          BEGIN { wn=4; wp=3; wu=6; wc=4; wm=4 }
+          BEGIN { wn=4; wp=3; wu=6; wc=4; wm=4; wj=4 }
           { lines[NR]=$0
             if (length($2) > wn) wn = length($2)
             if (length($3) > wp) wp = length($3)
             if (length($4) > wu) wu = length($4)
             if (length($5) > wc) wc = length($5)
-            if (length($6) > wm) wm = length($6) }
+            if (length($6) > wm) wm = length($6)
+            if (length($7) > wj) wj = length($7) }
           END {
-            printf "  %-*s  %-*s  %-*s  %-*s  %-*s\n", wn, "NAME", wp, "PID", wu, "UPTIME", wc, "CPU", wm, "MEM"
-            tot = 4 + wn + wp + wu + wc + wm + 8
+            printf "  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s\n", \
+              wn, "NAME", wp, "PID", wu, "UPTIME", wc, "CPU", wm, "MEM", wj, "JOBS"
+            tot = 4 + wn + wp + wu + wc + wm + wj + 10
             for (i=0;i<tot;i++) printf "-"
             printf "\n"
             for (i=1; i<=NR; i++) {
@@ -779,8 +906,8 @@ dispatch_subcommand() {
               icon = (f[1]=="running") ? "✓" : "✗"
               c = ""; r = ""
               if (color) { r = "\033[0m"; c = (f[1]=="running") ? "\033[32m" : "\033[31m" }
-              printf "%s%s%s %-*s  %-*s  %-*s  %-*s  %-*s\n", \
-                c, icon, r, wn, f[2], wp, f[3], wu, f[4], wc, f[5], wm, f[6]
+              printf "%s%s%s %-*s  %-*s  %-*s  %-*s  %-*s  %-*s\n", \
+                c, icon, r, wn, f[2], wp, f[3], wu, f[4], wc, f[5], wm, f[6], wj, f[7]
             }
           }'
       fi
@@ -801,6 +928,93 @@ dispatch_subcommand() {
         return 2
       fi
       local_runner_logs "${positional[0]}"
+      ;;
+
+    stats)
+      # Aggregate fleet stats from the API + local-process metrics.
+      # Useful "is the fleet healthy at a glance" view distinct from the
+      # per-runner status table. Uses read_config_optional so missing
+      # config returns a clean error instead of `exit 1`-ing the REPL.
+      local repos=()
+      while IFS= read -r r; do
+        [[ -n "$r" ]] && repos+=("$r")
+      done < <(read_config_optional "${CONFIG_FILE:-$(config_path)}")
+      if [[ ${#repos[@]} -eq 0 ]]; then
+        echo "no repos configured (run \`add OWNER/REPO\` first)" >&2
+        return 1
+      fi
+
+      local rows
+      rows=$(collect_remote_runners "${repos[@]}") || return 1
+      if [[ -z "$rows" ]]; then
+        echo "(no runners found)"
+        return 0
+      fi
+
+      # Compute aggregates in one jq pass.
+      local agg
+      agg=$(jq -rs '
+        {
+          total:    length,
+          online:   ([.[] | select(.status == "online")]  | length),
+          offline:  ([.[] | select(.status == "offline")] | length),
+          err:      ([.[] | select(has("error"))]         | length),
+          busy:     ([.[] | select(.busy == true)]        | length),
+          idle:     ([.[] | select(.status == "online" and .busy == false)] | length),
+          total_cpu: ([.[] | select(.cpu_pct != null) | .cpu_pct] | add // 0),
+          total_mem: ([.[] | select(.rss_kb != null)  | .rss_kb]  | add // 0),
+          local_count: ([.[] | select(.local == true)] | length),
+          repos: ([.[] | .repo] | unique | length),
+          oses:  ([.[] | .os // "unknown"] | group_by(.) | map({os: .[0], count: length})),
+          top_labels: ([.[] | .labels // [] | .[]] | group_by(.) | map({label: .[0], count: length}) | sort_by(.count) | reverse | .[:5])
+        }
+      ' <<<"$rows")
+
+      if [[ "${JSON_OUTPUT:-0}" -eq 1 ]]; then
+        echo "$agg"
+        return 0
+      fi
+
+      local total online offline err busy idle total_cpu total_mem local_count repos_count
+      total=$(jq -r '.total' <<<"$agg")
+      online=$(jq -r '.online' <<<"$agg")
+      offline=$(jq -r '.offline' <<<"$agg")
+      err=$(jq -r '.err' <<<"$agg")
+      busy=$(jq -r '.busy' <<<"$agg")
+      idle=$(jq -r '.idle' <<<"$agg")
+      total_cpu=$(jq -r '.total_cpu' <<<"$agg")
+      total_mem=$(jq -r '.total_mem' <<<"$agg")
+      local_count=$(jq -r '.local_count' <<<"$agg")
+      repos_count=$(jq -r '.repos' <<<"$agg")
+      local total_mem_pretty
+      total_mem_pretty=$(fmt_rss "${total_mem:-0}")
+
+      local has_color=0
+      [[ -t 1 ]] && has_color=1
+
+      if [[ $has_color -eq 1 ]]; then
+        printf '\033[1;36m▸ Fleet stats\033[0m \033[2m(%d repos)\033[0m\n\n' "$repos_count"
+        printf '  \033[2mTotal runners      \033[0m %d\n' "$total"
+        printf '  \033[2mOnline / Offline   \033[0m \033[32m%d\033[0m / \033[31m%d\033[0m\n' "$online" "$offline"
+        [[ "$err" -gt 0 ]] && printf '  \033[2mErrored repos      \033[0m \033[33m%d\033[0m\n' "$err"
+        printf '  \033[2mBusy / Idle        \033[0m %d / %d\n' "$busy" "$idle"
+        printf '  \033[2mLocal (this host)  \033[0m %d (%s combined memory, %.1f%% CPU)\n' \
+          "$local_count" "$total_mem_pretty" "$total_cpu"
+      else
+        printf 'Fleet stats (%d repos)\n\n' "$repos_count"
+        printf '  Total runners     %d\n' "$total"
+        printf '  Online / Offline  %d / %d\n' "$online" "$offline"
+        [[ "$err" -gt 0 ]] && printf '  Errored repos     %d\n' "$err"
+        printf '  Busy / Idle       %d / %d\n' "$busy" "$idle"
+        printf '  Local (this host) %d (%s combined memory, %.1f%% CPU)\n' \
+          "$local_count" "$total_mem_pretty" "$total_cpu"
+      fi
+      echo
+      echo "Top labels:"
+      jq -r '.top_labels[] | "  \(.count)x \(.label)"' <<<"$agg"
+      echo
+      echo "By OS:"
+      jq -r '.oses[] | "  \(.count)x \(.os)"' <<<"$agg"
       ;;
 
     add)
@@ -1034,15 +1248,11 @@ render_repl_banner() {
   [[ -z "$short_host" ]] && short_host=$(hostname 2>/dev/null || echo "")
   local now
   now=$(date '+%H:%M:%S')
-  local hsum
-  hsum=$(host_summary)
   if [[ $has_color -eq 1 ]]; then
     printf '\033[1;36m▸ gh-runner-status\033[0m \033[2mv%s • %s • %s\033[0m\n' \
       "$VERSION" "${short_host:-localhost}" "$now"
-    printf '\033[2m  %s\033[0m\n' "$hsum"
   else
     printf 'gh-runner-status v%s • %s • %s\n' "$VERSION" "${short_host:-localhost}" "$now"
-    printf '  %s\n' "$hsum"
   fi
 }
 
@@ -1050,9 +1260,9 @@ render_repl_footer() {
   local has_color="$1"
   local refresh="${2:-30}"
   if [[ $has_color -eq 1 ]]; then
-    printf '\033[2m─ refreshing every %ss • \033[0m[r]\033[2mefresh \033[0m[c]\033[2mommand \033[0m[/]\033[2mslash \033[0m[a]\033[2mdd \033[0m[q]\033[2muit\033[0m\n' "$refresh"
+    printf '\033[2m─ refreshing every %ss • \033[0m[r]\033[2mefresh \033[0m[c]\033[2mommand \033[0m[/]\033[2mslash \033[0m[a]\033[2mdd \033[0m[h]\033[2melp \033[0m[q]\033[2muit\033[0m\n' "$refresh"
   else
-    printf -- '- refreshing every %ss • [r]efresh [c]ommand [/]slash [a]dd [q]uit\n' "$refresh"
+    printf -- '- refreshing every %ss • [r]efresh [c]ommand [/]slash [a]dd [h]elp [q]uit\n' "$refresh"
   fi
 }
 
@@ -1140,7 +1350,7 @@ handle_repl_line() {
         a)    words[0]="add" ;;
       esac
       case "${words[0]}" in
-        list|status|local|start|stop|restart|logs|notify|watch|add|remove)
+        list|status|local|start|stop|restart|logs|notify|watch|add|remove|stats)
           dispatch_subcommand "${words[@]}" || true
           ;;
         *)
@@ -1151,44 +1361,47 @@ handle_repl_line() {
   esac
 }
 
-# Drop into a single-line command prompt below the dashboard.
-# Optional second arg pre-fills the input line (used by the [/] and
-# [a] dashboard shortcuts to give the user a head start). Returns to
-# the dashboard after the command runs.
-prompt_and_run() {
+_pause_for_keypress() {
   local has_color="$1"
-  local prefill="${2:-}"
-  local prompt
-  if [[ $has_color -eq 1 ]]; then
-    prompt=$'\001\033[36m\002❯\001\033[0m\002 '
-  else
-    prompt='> '
-  fi
-  echo
-  local line
-  # `read -e -i <text>` pre-fills the readline buffer with <text>, so
-  # the user sees `❯ /` or `❯ add ` and can type the rest. Falls back
-  # to plain prompt if -i is unsupported (older bash).
-  if [[ -n "$prefill" ]]; then
-    if ! IFS= read -r -e -i "$prefill" -p "$prompt" line 2>/dev/null; then
-      echo
-      return 0
-    fi
-  else
-    if ! IFS= read -r -e -p "$prompt" line; then
-      echo
-      return 0
-    fi
-  fi
-  echo
-  handle_repl_line "$has_color" "$line"
   if [[ $has_color -eq 1 ]]; then
     printf '\n\033[2m── press any key to return to the dashboard ──\033[0m'
   else
     printf '\n-- press any key to return to the dashboard --'
   fi
-  read -rsn 1 _ 2>/dev/null
+  read -rsn 1 _ 2>/dev/null || true
   printf '\n'
+}
+
+# Drop into a single-line command prompt below the dashboard. Optional
+# second arg is a literal prefix prepended to whatever the user types,
+# so the [/] and [a] shortcuts can route into slash/add flows without
+# relying on bash 4's `read -e -i` (macOS default is bash 3.2).
+prompt_and_run() {
+  local has_color="$1"
+  local prefix="${2:-}"
+  local prompt_marker
+  if [[ $has_color -eq 1 ]]; then
+    prompt_marker=$'\033[36m❯\033[0m'
+  else
+    prompt_marker='>'
+  fi
+  echo
+  # Show the prompt + any locked-in prefix. The prefix isn't editable
+  # (deliberate: it's the dashboard shortcut they pressed), so we print
+  # it literally and read the user's continuation.
+  if [[ -n "$prefix" ]]; then
+    printf '%s %s' "$prompt_marker" "$prefix"
+  else
+    printf '%s ' "$prompt_marker"
+  fi
+  local line
+  if ! IFS= read -r line; then
+    echo
+    return 0
+  fi
+  echo
+  handle_repl_line "$has_color" "${prefix}${line}"
+  _pause_for_keypress "$has_color"
 }
 
 # The active monitoring loop: dashboard + key handler. Refreshes every
@@ -1224,13 +1437,11 @@ dashboard_loop() {
       r|R) ;; # fall through, loop redraws
       h|H|"?")
         repl_help
-        printf '\nPress any key...'
-        read -rsn 1 _ 2>/dev/null
-        printf '\n'
+        _pause_for_keypress "$has_color"
         ;;
       c|C) prompt_and_run "$has_color" ;;
-      /)   prompt_and_run "$has_color" "/" ;;     # pre-fill slash
-      a|A) prompt_and_run "$has_color" "add " ;;  # pre-fill add command
+      /)   prompt_and_run "$has_color" "/" ;;     # locked-in slash prefix
+      a|A) prompt_and_run "$has_color" "add " ;;  # locked-in add prefix
       "")  ;; # timeout, just redraw
       *)   ;; # ignore other keys
     esac
@@ -1306,7 +1517,7 @@ main() {
     subcommand="list"
   else
     case "${args[0]}" in
-      list|status|local|start|stop|restart|logs|notify|watch|add|remove)
+      list|status|local|start|stop|restart|logs|notify|watch|add|remove|stats)
         subcommand="${args[0]}"
         positional=("${args[@]:1}")
         ;;

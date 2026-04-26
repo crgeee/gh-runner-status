@@ -4,28 +4,53 @@ All notable changes to `gh-runner-status` are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+<!--
+This file is maintained by release-please. Do NOT edit the version
+sections below by hand — instead, write Conventional Commit messages
+(feat:, fix:, etc.) and the next merge to master will update this
+file automatically. The "Unreleased" section is what release-please
+will roll into the next tagged release.
+-->
+
 ## [Unreleased]
 
+## [0.3.0] — 2026-04-26
+
 ### Added
-- Interactive REPL mode (`gh runner-status` with no args, in a TTY) with slash commands (`/help`, `/repos`, `/clear`, `/quit`) and short-form aliases (`l`, `r`, `s`, `x`, `n`, `w`)
-- `watch [SECONDS]` subcommand: auto-refresh status table on an interval
+- **Live auto-refreshing dashboard** with single-key controls (`r` refresh, `c` command mode, `/` slash, `a` add, `h` help, `q` quit) — bare `gh runner-status` opens it in a TTY
+- **Per-runner CPU and MEM** in the main `list` table for runners installed on this machine, summed across the whole agent process tree (`runsvc.sh` + `Runner.Listener` + active workers)
+- `stats` subcommand: aggregate fleet view (online/offline/busy counts, total memory, top labels, OS distribution)
+- `add OWNER/REPO [NAME] [LABELS]`: mints a registration token via the GitHub API, appends to the config, prints copy-paste install commands for the target machine
+- `remove OWNER/REPO NAME_OR_ID`: deregisters a runner via the API; resolves id↔name so the cleanup hint always uses a valid LaunchAgent label
+- `watch [SECONDS] [REPOS...]` subcommand auto-refreshes the dashboard at a custom interval; non-TTY callers (cron, pipes) get a print-and-sleep loop
+- `local` subcommand expanded with PID / UPTIME / CPU / MEM / JOBS columns
 - Status icons in the table (`✓` online, `✗` offline, `⚠` error). Set `NO_ICONS=1` to disable
-- `notify` subcommand sends Telegram alerts when runners go offline or repo lookups fail
-- Local runner control: `start`, `stop`, `restart`, `logs` for LaunchAgents (macOS) and systemd services (Linux)
-- `local` subcommand: list runners installed on the current machine
-- 38 bats tests covering arg parsing, input validation, Telegram config safety, table rendering
-- CI on Ubuntu + macOS (shellcheck + bats), informational kcov coverage on Ubuntu
+- 49 bats tests covering arg parsing, input validation, Telegram config safety, table rendering, and metric formatters
+- CI runs the bats suite on Ubuntu + macOS, **plus a second bats run under macOS `/bin/bash` 3.2** to catch bashisms (shellcheck doesn't have version-specific lint)
+- kcov coverage on Ubuntu, uploaded as a workflow artifact and to Codecov when a token is set
+- Pre-commit `.githooks/pre-commit` integration; SECURITY.md, CONTRIBUTING.md
+
+### Changed
+- `gh runner-status` (no args, in a TTY) now opens the live dashboard instead of a passive prompt
+- Banner stripped of host uptime/load/mem — was confusing per-runner-vs-host stats; per-runner is what matters
+- `JOBS` column dropped from main `list` (the API's `BUSY` is more authoritative); kept in `local` for diagnostic detail
 
 ### Security
 - Repo names regex-validated before reaching `gh api` (no `../../foo` path traversal)
-- Runner names regex-validated to require `actions.runner.<owner>-<repo>.<runner>` form (no `--no-block`/`default.target` reparse)
+- Runner names regex-validated to require `actions.runner.<owner>-<repo>.<runner>` form (no `--no-block`/`default.target` reparse); rejects segments starting with `-`
 - Telegram config is **parsed**, never sourced — malicious config cannot run code
 - Bot token sent via `curl --config -` (stdin), never lands in argv
 - Telegram message body sent via `data-urlencode "text@<tempfile>"`, immune to content with quotes or newlines
-- `notify` distinguishes offline vs errored repos and always alerts on total token-expiry failures regardless of `--threshold`
+- `notify` correctly distinguishes offline vs errored repos and always alerts on total token-expiry failures regardless of `--threshold`
 
 ### Performance
 - `render_table` uses a single jq pass + awk instead of ~5 jq invocations per row (was 500+ for 100 runners). 0.04s user time for ~10 runners.
+
+### Fixed
+- `[/]` and `[a]` dashboard pre-fill keys — refactored away from bash-4-only `read -e -i` so they work on macOS default `/bin/bash` 3.2
+- `Ctrl-D` now exits the dashboard cleanly (was treated as a timeout, kept refreshing)
+- `local` subcommand surfaces errors from `list_local_runners` instead of conflating "OS unsupported" with "no runners installed"
+- `[h]elp` added to the dashboard footer hint (was missing)
 
 ## [0.1.0] — 2026-04-26
 

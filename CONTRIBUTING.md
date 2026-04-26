@@ -66,9 +66,34 @@ Out of scope:
 
 If you're not sure, open an issue first.
 
-## Commit messages
+## Commit messages and releases
 
-Conventional Commits prefixes preferred but not required: `feat:`, `fix:`, `docs:`, `chore:`, `test:`, `refactor:`, `review:`. Imperative mood, focused on the why.
+This repo uses [Conventional Commits](https://www.conventionalcommits.org/) to drive **automated versioning + GitHub releases** via [release-please](https://github.com/googleapis/release-please).
+
+| Prefix | Version bump | Example |
+|---|---|---|
+| `feat:` | minor (`0.x.0` → `0.(x+1).0`) | `feat: add stats subcommand` |
+| `fix:` | patch (`0.x.y` → `0.x.(y+1)`) | `fix: handle Ctrl-D in dashboard loop` |
+| `feat!:` or footer `BREAKING CHANGE:` | major | `feat!: drop bash 3.2 support` |
+| `docs:`, `chore:`, `test:`, `refactor:`, `review:` | none | won't trigger a release |
+
+When PRs with `feat:` / `fix:` titles land on `master`, release-please opens (or updates) a single **"release PR"**. Merging that release PR:
+
+1. Bumps `VERSION` in `gh-runner-status` (annotated `# x-release-please-version`)
+2. Updates `CHANGELOG.md` (rolls `[Unreleased]` into a dated section)
+3. Tags the merge commit `vX.Y.Z`
+4. Creates a GitHub release with the changelog body
+
+End users get the new version on their next `gh extension upgrade gh-runner-status`.
+
+**Don't manually edit:**
+- `VERSION="X.Y.Z"` in `gh-runner-status`
+- The `[X.Y.Z] — DATE` sections of `CHANGELOG.md`
+- `.release-please-manifest.json`
+
+Just write good commit messages; release-please does the rest.
+
+Imperative mood, focused on the why.
 
 ## Security issues
 
