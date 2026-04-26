@@ -559,18 +559,30 @@ local_runner_version() {
   local dir
   dir=$(local_runner_install_dir "$name")
   [[ -z "$dir" ]] && { echo ""; return 0; }
-  # Match `bin.<digits>.<digits>.<digits>` exactly; fall through to
-  # nothing if no versioned dir exists (some installs have only `bin/`).
+  # Match `bin.<digits>.<digits>.<digits>` exactly. Strip the path
+  # prefix BEFORE sorting so dotted directory names (e.g.
+  # /opt/actions-runner.v2/bin.2.334.0) don't confuse the
+  # dot-delimited version sort.
   find "$dir" -maxdepth 1 -type d -name 'bin.[0-9]*.[0-9]*.[0-9]*' 2>/dev/null \
-    | sort -t. -k2,2n -k3,3n -k4,4n \
-    | tail -1 \
-    | sed 's|.*/bin\.||'
+    | sed 's|.*/bin\.||' \
+    | sort -t. -k1,1n -k2,2n -k3,3n \
+    | tail -1
 }
 
-# Latest Actions Runner release. Cached in $TMPDIR for an hour so the
-# dashboard doesn't hit the API every refresh. Returns "" on failure.
+# Latest Actions Runner release. Cached for an hour so the dashboard
+# doesn't hit the API every refresh. Cache lives under XDG_CACHE_HOME
+# (or ~/.cache) — more durable than $TMPDIR and harder to clobber via
+# symlink races in a shared $TMPDIR. Writes go to a temp file and are
+# atomically renamed so concurrent processes never see a partial read.
+_latest_version_cache_path() {
+  local base="${XDG_CACHE_HOME:-$HOME/.cache}/gh-runner-status"
+  mkdir -p "$base" 2>/dev/null || true
+  echo "$base/latest_runner_version"
+}
+
 latest_runner_version() {
-  local cache="${TMPDIR:-/tmp}/gh-runner-status.latest_runner_version"
+  local cache
+  cache=$(_latest_version_cache_path)
   if [[ -f "$cache" ]]; then
     local mtime now age
     mtime=$(stat -f %m "$cache" 2>/dev/null || stat -c %Y "$cache" 2>/dev/null || echo 0)
@@ -584,7 +596,16 @@ latest_runner_version() {
   local v
   v=$(gh api repos/actions/runner/releases/latest --jq .tag_name 2>/dev/null | sed 's/^v//')
   if [[ -n "$v" ]]; then
-    echo "$v" >"$cache"
+    # Atomic write: temp file in the same dir + rename. Concurrent
+    # readers see either the old contents or the new ones, never a
+    # partial write.
+    local tmp
+    tmp=$(mktemp "$cache.XXXXXX") || { echo "$v"; return 0; }
+    if printf '%s\n' "$v" >"$tmp"; then
+      mv -f "$tmp" "$cache" || rm -f "$tmp"
+    else
+      rm -f "$tmp"
+    fi
     echo "$v"
   elif [[ -f "$cache" ]]; then
     cat "$cache"   # stale-but-better-than-nothing
@@ -1235,16 +1256,28 @@ dispatch_subcommand() {
       ;;
 
     update)
-      # `update [--check] NAME` — show or apply a runner version upgrade.
-      # Without --check, executes the upgrade: stop runner, download
-      # latest tarball, extract over install dir, restart runner.
-      # `--check` is non-destructive — just reports installed vs latest.
+      # `update [--check] [NAME]` — show or apply a runner version
+      # upgrade. Without --check, executes: stop, download, extract,
+      # start. `--check` is non-destructive. With no NAME, prints a
+      # fleet-wide outdated report.
       local check_only=0
       local target=""
+      local saw_name=0
       for arg in ${positional[@]:+"${positional[@]}"}; do
         case "$arg" in
           --check) check_only=1 ;;
-          *) target="$arg" ;;
+          --*)
+            echo "error: unknown flag '$arg' for update" >&2
+            echo "usage: update [--check] [RUNNER_NAME]" >&2
+            return 2 ;;
+          *)
+            if [[ $saw_name -eq 1 ]]; then
+              echo "error: update accepts at most one runner name (got extra: '$arg')" >&2
+              return 2
+            fi
+            target="$arg"
+            saw_name=1
+            ;;
         esac
       done
 
@@ -1327,8 +1360,27 @@ dispatch_subcommand() {
 
       echo
       echo "Stopping $label..."
-      local_runner_action stop "$label" 2>/dev/null || true
-      sleep 1
+      if ! local_runner_action stop "$label"; then
+        echo "error: failed to stop $label; aborting upgrade." >&2
+        return 1
+      fi
+      # Wait briefly for the agent to actually exit (launchctl bootout
+      # is asynchronous). 10x 200ms = 2s max, then we abort if the
+      # PID is still alive — better to fail loudly than rip files out
+      # from under a running process.
+      local i still_running=0
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        if [[ -z "$(local_runner_pid "$label")" ]]; then
+          still_running=0
+          break
+        fi
+        still_running=1
+        sleep 0.2
+      done
+      if [[ $still_running -eq 1 ]]; then
+        echo "error: $label is still running after stop; aborting upgrade." >&2
+        return 1
+      fi
 
       local tmpdir
       tmpdir=$(mktemp -d)
@@ -1336,21 +1388,29 @@ dispatch_subcommand() {
       if ! curl -fsSL "$url" -o "$tmpdir/runner.tgz"; then
         echo "error: download failed" >&2
         rm -rf "$tmpdir"
-        # Try to restart anyway
-        local_runner_action start "$label" 2>/dev/null || true
+        # Try to restart so we don't leave the runner stopped.
+        echo "Attempting to restart $label..."
+        local_runner_action start "$label" >&2 || true
         return 1
       fi
 
       echo "Extracting into $install_dir..."
-      tar -xzf "$tmpdir/runner.tgz" -C "$install_dir" || {
+      if ! tar -xzf "$tmpdir/runner.tgz" -C "$install_dir"; then
         echo "error: extraction failed; runner may be in inconsistent state." >&2
         rm -rf "$tmpdir"
+        # Best-effort restart so the user has a chance of recovering.
+        echo "Attempting to restart $label..."
+        local_runner_action start "$label" >&2 || true
         return 1
-      }
+      fi
       rm -rf "$tmpdir"
 
       echo "Starting $label..."
-      local_runner_action start "$label" || true
+      if ! local_runner_action start "$label"; then
+        echo "error: extraction succeeded but failed to start $label." >&2
+        echo "Runner is now upgraded but stopped. Try \`gh runner-status start $label\` manually." >&2
+        return 1
+      fi
 
       echo "Updated $label to $latest."
       ;;
