@@ -1,81 +1,92 @@
 #!/usr/bin/env bats
 # Input validation: regex guards on repo names and runner names.
+# Source-loaded so we can call validate_* directly without hitting `gh`.
 
 setup() {
+  GH_RUNNER_STATUS_NO_MAIN=1 . "${BATS_TEST_DIRNAME}/../gh-runner-status"
   SCRIPT="${BATS_TEST_DIRNAME}/../gh-runner-status"
 }
 
-@test "rejects path traversal in repo name" {
-  run "$SCRIPT" "owner/../../etc/passwd"
-  [ "$status" -eq 2 ]
+@test "validate_repo rejects path traversal" {
+  run validate_repo "owner/../../etc/passwd"
+  [ "$status" -eq 1 ]
   [[ "$output" == *"invalid repo"* ]]
 }
 
-@test "rejects repo with query string" {
-  run "$SCRIPT" 'owner/repo?leak=1'
-  [ "$status" -eq 2 ]
-  [[ "$output" == *"invalid repo"* ]]
+@test "validate_repo rejects query string" {
+  run validate_repo 'owner/repo?leak=1'
+  [ "$status" -eq 1 ]
 }
 
-@test "rejects repo with fragment" {
-  run "$SCRIPT" 'owner/repo#frag'
-  [ "$status" -eq 2 ]
-  [[ "$output" == *"invalid repo"* ]]
+@test "validate_repo rejects fragment" {
+  run validate_repo 'owner/repo#frag'
+  [ "$status" -eq 1 ]
 }
 
-@test "rejects empty repo segments" {
-  run "$SCRIPT" "owner/"
-  [ "$status" -eq 2 ]
+@test "validate_repo rejects empty repo segments" {
+  run validate_repo "owner/"
+  [ "$status" -eq 1 ]
 }
 
-@test "rejects single-segment repo" {
-  run "$SCRIPT" "owner"
-  [ "$status" -eq 2 ]
+@test "validate_repo rejects single-segment repo" {
+  run validate_repo "owner"
+  [ "$status" -eq 1 ]
 }
 
-@test "accepts valid repo shape (network call may fail; we only check validation)" {
-  # We don't actually mock gh here; just verify validation doesn't reject.
-  # If gh is unauthenticated this errors AFTER validation, which is fine.
-  run "$SCRIPT" "valid-owner/valid-repo"
-  # Either succeeds (real call) or fails for non-validation reason; in
-  # both cases the validation message must NOT appear.
-  [[ "$output" != *"invalid repo"* ]]
+@test "validate_repo accepts canonical owner/repo" {
+  run validate_repo "valid-owner/valid-repo"
+  [ "$status" -eq 0 ]
 }
 
-@test "rejects runner name with shell-flag prefix" {
-  run "$SCRIPT" restart -- "--no-block"
-  [ "$status" -eq 2 ]
-  [[ "$output" == *"invalid runner name"* ]]
+@test "validate_repo accepts dots and underscores" {
+  run validate_repo "my.org/my_repo.name-1"
+  [ "$status" -eq 0 ]
 }
 
-@test "rejects runner name that's a systemd target" {
-  run "$SCRIPT" restart -- "default.target"
-  [ "$status" -eq 2 ]
-  [[ "$output" == *"invalid runner name"* ]]
+@test "validate_runner_name rejects shell-flag prefix" {
+  run validate_runner_name "actions.runner.--no-block"
+  [ "$status" -eq 1 ]
 }
 
-@test "rejects runner name without actions.runner. prefix" {
-  run "$SCRIPT" stop "evil-name"
-  [ "$status" -eq 2 ]
-  [[ "$output" == *"invalid runner name"* ]]
+@test "validate_runner_name rejects systemd target" {
+  run validate_runner_name "default.target"
+  [ "$status" -eq 1 ]
 }
 
-@test "accepts canonical runner name shape" {
-  # Will fail because the LaunchAgent doesn't exist, but should pass the
-  # regex check (we look for the validation message specifically).
-  run "$SCRIPT" stop "actions.runner.fake-org.runner-1"
-  [[ "$output" != *"invalid runner name"* ]]
+@test "validate_runner_name rejects single-segment after prefix" {
+  run validate_runner_name "actions.runner.foo"
+  [ "$status" -eq 1 ]
 }
 
-@test "--threshold rejects non-numeric" {
+@test "validate_runner_name rejects without actions.runner. prefix" {
+  run validate_runner_name "evil-name"
+  [ "$status" -eq 1 ]
+}
+
+@test "validate_runner_name accepts canonical shape" {
+  run validate_runner_name "actions.runner.fake-org.runner-1"
+  [ "$status" -eq 0 ]
+}
+
+@test "validate_runner_name accepts owner-with-dots" {
+  run validate_runner_name "actions.runner.my.org-my-repo.runner-1"
+  [ "$status" -eq 0 ]
+}
+
+@test "CLI: --threshold rejects non-numeric" {
   run "$SCRIPT" notify --threshold abc
   [ "$status" -eq 2 ]
   [[ "$output" == *"non-negative integer"* ]]
 }
 
-@test "--threshold accepts zero" {
-  # Zero should parse successfully even if notify itself errors out
-  # later for missing config — we only check the parser.
-  run "$SCRIPT" notify --threshold=0 owner/repo
-  [[ "$output" != *"non-negative integer"* ]]
+@test "CLI: --threshold without value gives clear error" {
+  run "$SCRIPT" notify --threshold
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"non-negative integer"* ]]
+}
+
+@test "CLI: --config without value gives clear error" {
+  run "$SCRIPT" --config
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"requires a value"* ]]
 }

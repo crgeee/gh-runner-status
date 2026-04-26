@@ -1,17 +1,16 @@
 #!/usr/bin/env bats
 # Telegram config parser: must NOT execute arbitrary shell.
+# Tests source-load the script so we hit load_telegram_config directly,
+# no `gh api` calls, no network.
 
 setup() {
-  SCRIPT="${BATS_TEST_DIRNAME}/../gh-runner-status"
+  GH_RUNNER_STATUS_NO_MAIN=1 . "${BATS_TEST_DIRNAME}/../gh-runner-status"
   TMPDIR=$(mktemp -d)
   XDG_CONFIG_HOME="$TMPDIR/config"
   mkdir -p "$XDG_CONFIG_HOME/gh-runner-status"
   CFG="$XDG_CONFIG_HOME/gh-runner-status/telegram"
-  REPOS="$XDG_CONFIG_HOME/gh-runner-status/repos"
-  echo "owner/repo" > "$REPOS"
   export XDG_CONFIG_HOME
-  export TELEGRAM_BOT_TOKEN=""
-  export TELEGRAM_CHAT_ID=""
+  unset TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID
 }
 
 teardown() {
@@ -20,16 +19,12 @@ teardown() {
 }
 
 @test "malicious config does NOT execute arbitrary shell" {
-  # If load_telegram_config used `source`, this would create a sentinel
-  # file. We verify it does not.
   cat > "$CFG" <<EOF
 TELEGRAM_BOT_TOKEN=fake
 TELEGRAM_CHAT_ID=123
 \$(touch $TMPDIR/POWNED)
 EOF
-  # Run notify so load_telegram_config fires. The notify path needs gh
-  # auth to actually send, but we only care about config-parsing here.
-  run "$SCRIPT" notify owner/repo --threshold 99
+  load_telegram_config
   [ ! -f "$TMPDIR/POWNED" ]
 }
 
@@ -39,11 +34,10 @@ TELEGRAM_BOT_TOKEN=fake_token
 TELEGRAM_CHAT_ID=12345
 EVIL_VAR=should_not_appear
 EOF
-  # Hard to assert without running notify against a real bot; instead
-  # verify the parser at least doesn't crash and doesn't surface
-  # EVIL_VAR in any error message.
-  run "$SCRIPT" notify owner/repo --threshold 99
-  [[ "$output" != *"should_not_appear"* ]]
+  load_telegram_config
+  [ "$TELEGRAM_BOT_TOKEN" = "fake_token" ]
+  [ "$TELEGRAM_CHAT_ID" = "12345" ]
+  [ -z "${EVIL_VAR:-}" ]
 }
 
 @test "comments and blank lines are tolerated" {
@@ -55,9 +49,31 @@ TELEGRAM_BOT_TOKEN=fake
 
 TELEGRAM_CHAT_ID=1
 EOF
-  run "$SCRIPT" notify owner/repo --threshold 99
-  # Should not error out on parser; may error later on telegram_send
-  # because the token is fake. Check it didn't crash on parse.
-  [[ "$output" != *"unbound variable"* ]]
-  [[ "$output" != *"syntax error"* ]]
+  load_telegram_config
+  [ "$TELEGRAM_BOT_TOKEN" = "fake" ]
+  [ "$TELEGRAM_CHAT_ID" = "1" ]
+}
+
+@test "CRLF line endings are tolerated" {
+  printf 'TELEGRAM_BOT_TOKEN=tok\r\nTELEGRAM_CHAT_ID=42\r\n' > "$CFG"
+  load_telegram_config
+  [ "$TELEGRAM_BOT_TOKEN" = "tok" ]
+  [ "$TELEGRAM_CHAT_ID" = "42" ]
+}
+
+@test "env vars take precedence over config file" {
+  cat > "$CFG" <<EOF
+TELEGRAM_BOT_TOKEN=from_file
+TELEGRAM_CHAT_ID=from_file
+EOF
+  TELEGRAM_BOT_TOKEN=from_env load_telegram_config
+  # The conditional only loads from file when env is empty, so env should win.
+  # We re-export-load: TELEGRAM_BOT_TOKEN was passed inline, so it's set
+  # in our environment for that one call. Verify file values for chat_id
+  # (which was unset) loaded but bot_token was preserved.
+  unset TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID
+  TELEGRAM_BOT_TOKEN=preset
+  load_telegram_config
+  [ "$TELEGRAM_BOT_TOKEN" = "preset" ]
+  [ "$TELEGRAM_CHAT_ID" = "from_file" ]
 }

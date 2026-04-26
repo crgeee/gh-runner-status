@@ -99,7 +99,7 @@ validate_repo() {
   local repo="$1"
   if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
     echo "error: invalid repo (expected owner/name, got: $repo)" >&2
-    exit 2
+    return 1
   fi
 }
 
@@ -108,9 +108,12 @@ validate_repo() {
 # installer always names runners actions.runner.<owner>-<repo>.<runner>.
 validate_runner_name() {
   local name="$1"
-  if [[ ! "$name" =~ ^actions\.runner\.[A-Za-z0-9_.-]+$ ]]; then
+  # Match `actions.runner.<owner>-<repo>.<runner>` exactly. Two segments
+  # after the prefix, neither may start with `-` (which would make the
+  # name reparse as a flag by launchctl/systemctl/tail).
+  if [[ ! "$name" =~ ^actions\.runner\.[A-Za-z0-9_][A-Za-z0-9_.-]*\.[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
     echo "error: invalid runner name (expected actions.runner.OWNER-REPO.NAME, got: $name)" >&2
-    exit 2
+    return 1
   fi
 }
 
@@ -191,10 +194,10 @@ fetch_runners() {
 collect_remote_runners() {
   # Args: list of repos. Outputs newline-delimited JSON to stdout.
   local repos=("$@")
-  # Validate every repo upfront — fetch_runners runs in a subshell where
-  # `exit` from validate_repo wouldn't reach the parent.
+  # Validate every repo upfront so a bad name fails fast before we
+  # spawn parallel API calls.
   for repo in "${repos[@]}"; do
-    validate_repo "$repo"
+    validate_repo "$repo" || return 1
   done
   tmpdir=$(mktemp -d)
   local i=0
@@ -394,18 +397,27 @@ telegram_send() {
     echo "set them in env or $(config_dir)/telegram" >&2
     return 1
   fi
-  # Pass the URL via curl --config (stdin) so the bot token never lands
-  # in argv, where `ps auxe` could leak it on a multi-user host.
-  # Plain text only (no parse_mode) so user-controlled error strings
-  # with `_*[` don't trip the parser and silently drop the alert.
+
+  # Write the message to a temp file and pass via `data-urlencode = "text@FILE"`.
+  # curl reads the file's contents and url-encodes them — handles arbitrary
+  # newlines, quotes, and backslashes that would otherwise break the
+  # line-oriented config syntax. Token still lands via stdin (--config -),
+  # not argv, so `ps auxe` can't see it.
+  local msg_file
+  msg_file=$(mktemp)
+  # Trap-local cleanup; don't disturb the script-level EXIT trap that
+  # cleans up tmpdir.
+  printf '%s' "$message" >"$msg_file"
+
   local http
   http=$(curl -sS -X POST --config - -o /dev/null -w '%{http_code}' <<EOF
 url = "https://api.telegram.org/bot${token}/sendMessage"
 data-urlencode = "chat_id=${chat}"
-data-urlencode = "text=${message}"
+data-urlencode = "text@${msg_file}"
 data-urlencode = "disable_notification=false"
 EOF
 )
+  rm -f "$msg_file"
   [[ "$http" == "200" ]]
 }
 
@@ -430,13 +442,16 @@ run_notify() {
 
   # Edge case: every repo errored (bad token / network down). Always
   # alert regardless of threshold — silent failure is the worst outcome.
+  # fetch_runners emits one {repo, error} object per failed repo, so
+  # error_count == #repos AND offline_count == 0 means total failure.
   local total_repo_failure=0
-  if [[ $error_count -gt 0 && $error_count -ge ${#repos[@]} && $offline_count -eq 0 && $total -eq 0 ]]; then
+  if [[ $error_count -ge ${#repos[@]} && $offline_count -eq 0 ]]; then
     total_repo_failure=1
   fi
 
   if [[ $total_repo_failure -eq 0 && $bad_count -lt $threshold ]]; then
-    echo "ok: $total runner(s) checked across ${#repos[@]} repo(s); all online"
+    local online_count=$(( total - offline_count - error_count ))
+    echo "ok: $online_count runner(s) online across ${#repos[@]} repo(s)"
     return 0
   fi
 
@@ -458,10 +473,11 @@ run_notify() {
     headline="🚨 gh-runner-status: ${bad_count} runner(s) need attention"
   fi
 
+  local online_count=$(( total - offline_count - error_count ))
   local message
   message="${headline}
 Host: ${short_host}
-Online: $((total - offline_count))/${total}; Offline: ${offline_count}; Errored: ${error_count}
+Online: ${online_count}/${total}; Offline: ${offline_count}; Errored: ${error_count}
 
 ${detail}"
 
@@ -476,6 +492,225 @@ ${detail}"
 }
 
 # ---------------------------------------------------------------------------
+# Subcommand dispatch — shared between one-shot CLI and interactive REPL
+# ---------------------------------------------------------------------------
+
+# Args: <subcommand> [positional...]. Reads CONFIG_FILE, JSON_OUTPUT,
+# NOTIFY_THRESHOLD from the environment. Returns 0 on success, 1 on
+# user error, 2 on bad args. Never calls exit; the REPL needs to
+# survive errors.
+dispatch_subcommand() {
+  local subcommand="$1"; shift
+  local positional=("$@")
+
+  case "$subcommand" in
+    list|status)
+      local repos=()
+      if [[ ${#positional[@]} -gt 0 ]]; then
+        for arg in "${positional[@]}"; do
+          while IFS= read -r r; do
+            [[ -n "$r" ]] && repos+=("$r")
+          done < <(tr ',' '\n' <<<"$arg")
+        done
+      else
+        while IFS= read -r r; do
+          [[ -n "$r" ]] && repos+=("$r")
+        done < <(read_config "${CONFIG_FILE:-$(config_path)}" 2>&1) || return 1
+      fi
+
+      if [[ ${#repos[@]} -eq 0 ]]; then
+        echo "error: no repos (pass as args or populate ${CONFIG_FILE:-$(config_path)})" >&2
+        return 1
+      fi
+
+      local rows
+      rows=$(collect_remote_runners "${repos[@]}") || return 1
+
+      if [[ "${JSON_OUTPUT:-0}" -eq 1 ]]; then
+        if [[ -z "$rows" ]]; then echo "[]"; else jq -s '.' <<<"$rows"; fi
+      else
+        render_table "$rows"
+      fi
+      ;;
+
+    local)
+      if [[ "${JSON_OUTPUT:-0}" -eq 1 ]]; then
+        list_local_runners | jq -Rn '[inputs | select(length > 0) | {name: .}]'
+      else
+        local found=0
+        while IFS= read -r r; do
+          [[ -z "$r" ]] && continue
+          echo "$r"
+          found=1
+        done < <(list_local_runners)
+        [[ $found -eq 0 ]] && echo "(no local runners found)"
+      fi
+      ;;
+
+    start|stop|restart)
+      if [[ ${#positional[@]} -ne 1 ]]; then
+        echo "error: $subcommand requires exactly one runner name" >&2
+        echo "use \`local\` to list installed runners" >&2
+        return 2
+      fi
+      local_runner_action "$subcommand" "${positional[0]}"
+      ;;
+
+    logs)
+      if [[ ${#positional[@]} -ne 1 ]]; then
+        echo "error: logs requires exactly one runner name" >&2
+        return 2
+      fi
+      local_runner_logs "${positional[0]}"
+      ;;
+
+    notify)
+      load_telegram_config
+      command -v curl >/dev/null 2>&1 || {
+        echo "error: 'curl' is required for notify" >&2
+        return 2
+      }
+      local repos=()
+      if [[ ${#positional[@]} -gt 0 ]]; then
+        for arg in "${positional[@]}"; do
+          while IFS= read -r r; do
+            [[ -n "$r" ]] && repos+=("$r")
+          done < <(tr ',' '\n' <<<"$arg")
+        done
+      else
+        while IFS= read -r r; do
+          [[ -n "$r" ]] && repos+=("$r")
+        done < <(read_config "${CONFIG_FILE:-$(config_path)}" 2>&1) || return 1
+      fi
+
+      if [[ ${#repos[@]} -eq 0 ]]; then
+        echo "error: no repos given for notify" >&2
+        return 1
+      fi
+
+      run_notify "${repos[@]}"
+      ;;
+
+    *)
+      echo "error: unknown command '$subcommand'" >&2
+      echo "type /help for available commands" >&2
+      return 2
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Interactive mode (REPL)
+# ---------------------------------------------------------------------------
+
+repl_help() {
+  cat <<'EOF'
+Slash commands:
+  /help, /?      Show this help
+  /repos         Show configured repos
+  /clear         Clear the screen
+  /quit, /exit   Exit (also: Ctrl-D)
+
+Inline commands (same shape as the one-shot CLI):
+  list, status         Show runner status table
+  local                List runners installed on this machine
+  start NAME           Start a local runner
+  stop NAME            Stop a local runner
+  restart NAME         Restart a local runner
+  logs NAME            Tail recent logs
+  notify               Send Telegram alert if any runner is offline
+
+Tip: bare `gh runner-status` enters this REPL; pass a subcommand to
+run one-shot.
+EOF
+}
+
+interactive_mode() {
+  local has_color=0
+  [[ -t 1 ]] && has_color=1
+
+  if [[ $has_color -eq 1 ]]; then
+    printf '\033[1;36m▸ gh-runner-status\033[0m \033[2mv%s\033[0m\n' "$VERSION"
+    printf '\033[2mtype /help for commands • Ctrl-D to exit\033[0m\n\n'
+  else
+    printf 'gh-runner-status v%s — type /help for commands, Ctrl-D to exit\n\n' "$VERSION"
+  fi
+
+  local prompt
+  if [[ $has_color -eq 1 ]]; then
+    prompt=$'\001\033[36m\002❯\001\033[0m\002 '
+  else
+    prompt='> '
+  fi
+
+  while true; do
+    local line
+    if ! IFS= read -r -e -p "$prompt" line; then
+      [[ $has_color -eq 1 ]] && printf '\n'
+      break
+    fi
+
+    # Trim leading/trailing whitespace
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+
+    # Save into bash history so up-arrow works
+    history -s -- "$line" 2>/dev/null || true
+
+    case "$line" in
+      /help|/?|help|"?")
+        repl_help
+        ;;
+      /quit|/exit|exit|quit)
+        [[ $has_color -eq 1 ]] && printf '\033[2mbye!\033[0m\n' || echo "bye!"
+        break
+        ;;
+      /clear|clear)
+        clear
+        ;;
+      /repos)
+        local f="${CONFIG_FILE:-$(config_path)}"
+        if [[ -f "$f" ]]; then
+          echo "# $f"
+          cat "$f"
+        else
+          echo "(no config file at $f — run \`echo OWNER/REPO > $f\`)"
+        fi
+        ;;
+      /*)
+        echo "unknown slash command: $line"
+        echo "type /help"
+        ;;
+      *)
+        # Tokenize via xargs printf so quoted strings work, e.g.
+        # `restart "actions.runner.foo bar.baz"` (we still validate names later).
+        local words=()
+        while IFS= read -r w; do
+          [[ -n "$w" ]] && words+=("$w")
+        done < <(printf '%s' "$line" | xargs -n 1 printf '%s\n' 2>/dev/null || printf '%s' "$line")
+
+        if [[ ${#words[@]} -eq 0 ]]; then
+          continue
+        fi
+
+        # First token is the subcommand; rest are positional args.
+        # Allow bare repo args to default to `list`.
+        local first="${words[0]}"
+        case "$first" in
+          list|status|local|start|stop|restart|logs|notify)
+            dispatch_subcommand "${words[@]}" || true
+            ;;
+          *)
+            dispatch_subcommand list "${words[@]}" || true
+            ;;
+        esac
+        ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -483,10 +718,9 @@ main() {
   require gh
   require jq
 
-  local config_file
-  config_file=$(config_path)
-  local json_output=0
-  local subcommand="list"
+  CONFIG_FILE=$(config_path)
+  JSON_OUTPUT=0
+  local subcommand=""
   local positional=()
 
   # Parse flags first; allow them anywhere
@@ -495,11 +729,16 @@ main() {
     case "$1" in
       -h|--help) usage; exit 0 ;;
       --version) echo "gh-runner-status $VERSION"; exit 0 ;;
-      --json) json_output=1; shift ;;
-      --config) config_file="$2"; shift 2 ;;
-      --config=*) config_file="${1#--config=}"; shift ;;
+      --json) JSON_OUTPUT=1; shift ;;
+      --config)
+        if [[ $# -lt 2 ]]; then
+          echo "error: --config requires a value" >&2
+          exit 2
+        fi
+        CONFIG_FILE="$2"; shift 2 ;;
+      --config=*) CONFIG_FILE="${1#--config=}"; shift ;;
       --threshold)
-        if [[ ! "$2" =~ ^[0-9]+$ ]]; then
+        if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ ]]; then
           echo "error: --threshold requires a non-negative integer" >&2
           exit 2
         fi
@@ -517,111 +756,39 @@ main() {
     esac
   done
 
-  # First non-flag arg may be a subcommand; fall back to list.
-  if [[ ${#args[@]} -gt 0 ]]; then
+  # First non-flag arg may be a subcommand. If there's no arg AND stdin
+  # is a TTY, drop into the REPL — that's the "just like Claude Code"
+  # interactive experience. Non-TTY (cron, pipes) defaults to `list`
+  # so existing scripts keep working.
+  if [[ ${#args[@]} -eq 0 ]]; then
+    if [[ -t 0 && -t 1 ]]; then
+      interactive_mode
+      exit 0
+    fi
+    subcommand="list"
+  else
     case "${args[0]}" in
       list|status|local|start|stop|restart|logs|notify)
         subcommand="${args[0]}"
         positional=("${args[@]:1}")
         ;;
       *)
-        # No subcommand — treat all args as repos for default `list`.
+        subcommand="list"
         positional=("${args[@]}")
         ;;
     esac
   fi
 
-  case "$subcommand" in
-    list|status)
-      local repos=()
-      if [[ ${#positional[@]} -gt 0 ]]; then
-        for arg in "${positional[@]}"; do
-          while IFS= read -r r; do
-            [[ -n "$r" ]] && repos+=("$r")
-          done < <(tr ',' '\n' <<<"$arg")
-        done
-      else
-        while IFS= read -r r; do
-          [[ -n "$r" ]] && repos+=("$r")
-        done < <(read_config "$config_file")
-      fi
-
-      if [[ ${#repos[@]} -eq 0 ]]; then
-        echo "error: no repos given (pass as args or populate $config_file)" >&2
-        exit 1
-      fi
-
-      local rows
-      rows=$(collect_remote_runners "${repos[@]}")
-
-      if [[ $json_output -eq 1 ]]; then
-        if [[ -z "$rows" ]]; then echo "[]"; else jq -s '.' <<<"$rows"; fi
-      else
-        render_table "$rows"
-      fi
-      ;;
-
-    local)
-      if [[ $json_output -eq 1 ]]; then
-        list_local_runners | jq -Rn '[inputs | select(length > 0) | {name: .}]'
-      else
-        local found=0
-        while IFS= read -r r; do
-          [[ -z "$r" ]] && continue
-          echo "$r"
-          found=1
-        done < <(list_local_runners)
-        [[ $found -eq 0 ]] && echo "(no local runners found)"
-      fi
-      ;;
-
-    start|stop|restart)
-      if [[ ${#positional[@]} -ne 1 ]]; then
-        echo "error: $subcommand requires exactly one runner name" >&2
-        echo "use \`gh runner-status local\` to list installed runners" >&2
-        exit 2
-      fi
-      local_runner_action "$subcommand" "${positional[0]}"
-      ;;
-
-    logs)
-      if [[ ${#positional[@]} -ne 1 ]]; then
-        echo "error: logs requires exactly one runner name" >&2
-        exit 2
-      fi
-      local_runner_logs "${positional[0]}"
-      ;;
-
-    notify)
-      load_telegram_config
-      require curl
-      local repos=()
-      if [[ ${#positional[@]} -gt 0 ]]; then
-        for arg in "${positional[@]}"; do
-          while IFS= read -r r; do
-            [[ -n "$r" ]] && repos+=("$r")
-          done < <(tr ',' '\n' <<<"$arg")
-        done
-      else
-        while IFS= read -r r; do
-          [[ -n "$r" ]] && repos+=("$r")
-        done < <(read_config "$config_file")
-      fi
-
-      if [[ ${#repos[@]} -eq 0 ]]; then
-        echo "error: no repos given for notify" >&2
-        exit 1
-      fi
-
-      run_notify "${repos[@]}"
-      ;;
-
-    *)
-      echo "error: unknown subcommand '$subcommand'" >&2
-      usage
-      exit 2
-      ;;
-  esac
+  # macOS bash 3.2 errors on `"${empty[@]}"` under set -u; ${var:+...}
+  # makes the expansion safe whether positional is empty or populated.
+  dispatch_subcommand "$subcommand" ${positional[@]:+"${positional[@]}"}
+  local rc=$?
+  # Surface validation/usage errors as exit 2 (matches CLI norms);
+  # other non-zero returns become exit 1.
+  if [[ $rc -ne 0 ]]; then
+    exit 2
+  fi
+  exit 0
 }
 
 # Guard so test files can source the script for unit-testing functions
