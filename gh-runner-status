@@ -608,16 +608,20 @@ _resolve_runner_label() {
     echo "$input"
     return 0
   fi
+  # Capture both stdout AND exit code so we surface OS-unsupported as
+  # a real error instead of a misleading "no runner matching".
+  local raw rc
+  raw=$(list_local_runners 2>&1)
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "$raw" >&2
+    return $rc
+  fi
   local matches
-  matches=$(list_local_runners 2>/dev/null | awk -v n="$input" -F'.' '
-    # Last dot-separated segment is the runner short name in
-    # `actions.runner.<owner-repo>.<name>`. We rebuild the full label
-    # by joining all fields back; awk lets us avoid a second pass.
-    { print }
-  ' | awk -v n="$input" '
+  matches=$(echo "$raw" | awk -v n="$input" '
     BEGIN { count = 0 }
     {
-      # everything after the last dot
+      # short name = everything after the last dot in the label
       n_idx = match($0, /[^.]+$/)
       short = substr($0, n_idx)
       if (short == n) { found[count++] = $0 }
@@ -1324,16 +1328,20 @@ render_repl_footer() {
 # Render the active dashboard: banner, status table, footer. Used on
 # REPL entry and on /clear so the user always has live state visible
 # rather than a blank prompt.
-# Pull the current rows once and stash them in DASHBOARD_ROWS_CACHE.
+# Pull the current rows once and stash them in DASHBOARD_ROWS_CACHE,
+# along with DASHBOARD_CACHE_STATUS so the renderer can distinguish:
+#   ok           — rows ready to display (may be empty if no runners)
+#   no_config    — config file missing or empty
+#   fetch_error  — fetch attempted but failed (bad token, network down)
 # Called by the dashboard loop on first paint, on timer expiry, and on
 # explicit [r]efresh. Post-command redraws use the cache (no API call)
-# so they're instant and don't double-load when you press a key after
-# /help, c-mode, etc.
+# so they're instant.
 _dashboard_refresh_cache() {
   local cfg="${CONFIG_FILE:-$(config_path)}"
+  DASHBOARD_CACHE_AT=$SECONDS
   if [[ ! -f "$cfg" || ! -s "$cfg" ]]; then
     DASHBOARD_ROWS_CACHE=""
-    DASHBOARD_CACHE_AT=$SECONDS
+    DASHBOARD_CACHE_STATUS="no_config"
     return 0
   fi
   local repos=()
@@ -1342,11 +1350,15 @@ _dashboard_refresh_cache() {
   done < <(read_config_optional "$cfg")
   if [[ ${#repos[@]} -eq 0 ]]; then
     DASHBOARD_ROWS_CACHE=""
-    DASHBOARD_CACHE_AT=$SECONDS
+    DASHBOARD_CACHE_STATUS="no_config"
     return 0
   fi
-  DASHBOARD_ROWS_CACHE=$(collect_remote_runners "${repos[@]}" 2>&1) || DASHBOARD_ROWS_CACHE=""
-  DASHBOARD_CACHE_AT=$SECONDS
+  if DASHBOARD_ROWS_CACHE=$(collect_remote_runners "${repos[@]}" 2>&1); then
+    DASHBOARD_CACHE_STATUS="ok"
+  else
+    DASHBOARD_ROWS_CACHE=""
+    DASHBOARD_CACHE_STATUS="fetch_error"
+  fi
 }
 
 render_dashboard() {
@@ -1358,23 +1370,23 @@ render_dashboard() {
   render_repl_banner "$has_color"
   echo
 
-  local cfg="${CONFIG_FILE:-$(config_path)}"
-  if [[ -f "$cfg" ]] && [[ -s "$cfg" ]]; then
-    if [[ -n "${DASHBOARD_ROWS_CACHE:-}" ]]; then
+  case "${DASHBOARD_CACHE_STATUS:-no_config}" in
+    ok)
       render_table "$DASHBOARD_ROWS_CACHE"
-      # Cache-age hint helps the user understand why numbers might
-      # not exactly match "right now" — mostly cosmetic.
       local age=$(( SECONDS - ${DASHBOARD_CACHE_AT:-$SECONDS} ))
       if [[ $has_color -eq 1 && $age -gt 0 ]]; then
-        printf '\033[2m  (data %ds old; auto-refresh in %ds, [r] to force)\033[0m\n' \
-          "$age" "$(( refresh - age > 0 ? refresh - age : 0 ))"
+        local until=$(( refresh - age ))
+        (( until < 0 )) && until=0
+        printf '\033[2m  (data %ds old; auto-refresh in %ds, [r] to force)\033[0m\n' "$age" "$until"
       fi
-    else
+      ;;
+    fetch_error)
       # shellcheck disable=SC2016 # backticks intentional in the hint
-      printf '\033[33m(could not fetch runner status — check `gh auth status` and try `list`)\033[0m\n'
-    fi
-  else
-    cat <<EOF
+      printf '\033[33m(could not fetch runner status — check `gh auth status` and try [r])\033[0m\n'
+      ;;
+    no_config|*)
+      local cfg="${CONFIG_FILE:-$(config_path)}"
+      cat <<EOF
 no fleet configured yet. add one repo per line to:
   $cfg
 
@@ -1382,7 +1394,8 @@ press [a] to add a repo, or:
   mkdir -p $(dirname "$cfg")
   printf 'acme-corp/api\nacme-corp/web\n' > $cfg
 EOF
-  fi
+      ;;
+  esac
   echo
   render_repl_footer "$has_color" "$refresh"
 }
@@ -1515,14 +1528,17 @@ dashboard_loop() {
     # instant and don't re-hit the API.
     render_dashboard "$has_color" "$refresh"
 
-    # Compute remaining time-to-refresh so timeout = (refresh - cache_age).
-    # When that hits 0, we re-fetch on the next iteration.
+    # Time-to-next-refresh = refresh - age. When that's <=0, refresh
+    # immediately (use a fractional 0.01s timeout — `read -t 0` returns
+    # immediately regardless of input availability, which is what we
+    # want for steady-state on-interval refreshing without a 1s drift).
     local age=$(( SECONDS - DASHBOARD_CACHE_AT ))
     local remaining=$(( refresh - age ))
-    (( remaining < 1 )) && remaining=1
+    local read_timeout="$remaining"
+    (( remaining <= 0 )) && read_timeout="0.01"
 
     local key="" rc=0
-    read -rsn 1 -t "$remaining" key
+    read -rsn 1 -t "$read_timeout" key
     rc=$?
 
     # rc=0: keypress. rc=142 (or anything 128+): timeout. rc=1: EOF/error.

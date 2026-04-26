@@ -284,10 +284,19 @@ If a short name is ambiguous (two repos both have a `runner-1`), the command lis
 echo 'source ~/.local/share/gh/extensions/gh-runner-status/completions/gh-runner-status.bash' >> ~/.bashrc
 ```
 
-Tab-completes:
-- subcommands (`gh runner-status <TAB>` → `list local start stop ...`)
-- runner short names for `start/stop/restart/logs` (reads installed LaunchAgents/systemd units)
+After sourcing, tab-completion works for both:
+
+- `gh-runner-status <TAB>` (the binary, useful if `~/.local/share/gh/extensions/gh-runner-status` is on your PATH)
+- `gh runner-status <TAB>` (gh-extension form — the script registers a small wrapper on `gh` that delegates only when the first arg is `runner-status`)
+
+Completions provided:
+- subcommands (`list local start stop ...`)
+- runner short names for `start/stop/restart/logs` (reads installed LaunchAgents/systemd units, both user and system on Linux)
 - configured repos for `list/add/remove`
+
+Pure bash, compatible with bash 3.2 (macOS default).
+
+> Note: if you have GitHub's official `gh` shell completion installed, our `complete -F` registration replaces it. If you need both, source gh's own completion *after* this one — bash chains `complete` registrations in last-write-wins order.
 
 ## Security
 
