@@ -73,10 +73,11 @@ The runner name passed to `start`/`stop`/`restart`/`logs` is the LaunchAgent lab
 
 ## Interactive dashboard
 
-Run `gh runner-status` with no args (in a terminal) and you land on a live dashboard — banner, status table, command bar — followed by a prompt for ad-hoc commands:
+Run `gh runner-status` with no args (in a terminal) and you land on a **live, auto-refreshing dashboard** with single-key controls:
 
 ```
 ▸ gh-runner-status v0.2.0 • laptop • 14:32:01
+  uptime: 5d 2h • load: 1.2 1.4 1.5 • mem: 8.2/16G
 
   REPO            NAME        STATUS   BUSY  LABELS
 -----------------------------------------------------
@@ -84,22 +85,65 @@ Run `gh runner-status` with no args (in a terminal) and you land on a live dashb
 ✓ acme-corp/api   runner-2    online   yes   self-hosted,linux,x64
 ✗ acme-corp/web   runner-1    offline  no    self-hosted,linux,x64
 
-─ commands: list / local / restart NAME / watch / notify   slash: /help · /repos · /clear · /quit
-
-❯ restart actions.runner.acme-corp-web.runner-1
-restarted: actions.runner.acme-corp-web.runner-1
-
-❯ /clear     # re-renders the dashboard with fresh state
-
-❯ /quit
-bye!
+─ refreshing every 30s • [r]efresh [c]ommand [/]slash [a]dd [q]uit
 ```
 
-`/clear` re-renders the dashboard so you can refresh-on-demand without leaving the REPL. Up-arrow recalls history within the session.
+**Single-key controls** (no Enter needed):
 
-**Aliases:** `l`/`ls` → `list`, `r` → `restart`, `s` → `start`, `x` → `stop`, `n` → `notify`, `w` → `watch`.
+| Key | What it does |
+|---|---|
+| `r` | Refresh now (instead of waiting for the timer) |
+| `c` | **Command mode** — type a full command (`restart NAME`, `notify`, etc.) and the dashboard pauses until it finishes |
+| `/` | Slash command (`/help`, `/repos`, `/quit`) |
+| `a` | Quick path to `add OWNER/REPO` — register a new runner |
+| `h`, `?` | Show full help |
+| `q`, `Ctrl-D`, `Ctrl-C` | Quit cleanly back to the shell |
 
-For a *continuously* refreshing dashboard, use `gh runner-status watch` (defaults to 30s; pass an interval like `watch 5`).
+Command-mode aliases: `l`/`ls` → `list`, `r` → `restart`, `s` → `start`, `x` → `stop`, `n` → `notify`, `w` → `watch`, `a` → `add`.
+
+Custom interval: `gh runner-status watch 5` opens the same dashboard refreshing every 5 seconds. The default `gh runner-status` is 30s.
+
+## Local runner metrics
+
+`gh runner-status local` now shows running PIDs, process uptime, CPU%, and resident memory for every runner installed on the current machine — so you can see at a glance which agents are alive and how much they're using:
+
+```
+$ gh runner-status local
+
+  NAME                                              PID    UPTIME   CPU   MEM
+-------------------------------------------------------------------------------
+✓ actions.runner.acme-api.runner-1                  1234   2d 4h    0.0%  45M
+✓ actions.runner.acme-web.runner-1                  1235   2d 4h    0.0%  43M
+✗ actions.runner.acme-data.runner-1                 -      -        -     -
+```
+
+`--json` output includes the same metrics for scripting.
+
+## Add or remove a runner
+
+Register a new runner against a repo without touching GitHub's web UI:
+
+```bash
+gh runner-status add acme-corp/api                  # auto-uses hostname for runner name
+gh runner-status add acme-corp/api my-runner        # custom runner name
+gh runner-status add acme-corp/api my-runner gpu,linux,x64   # custom labels
+```
+
+The command:
+1. Calls the GitHub API to mint a registration token (valid ~1 hour)
+2. Adds the repo to your local config file (so `gh runner-status` will list it)
+3. Prints copy-paste commands you run on the *target machine* to download, configure, and install the runner as a service
+
+It deliberately does NOT ssh into the target — installation needs sudo on Linux and platform-specific paths, so the user-facing flow is "here's exactly what to paste."
+
+To deregister:
+
+```bash
+gh runner-status remove acme-corp/api my-runner     # by name
+gh runner-status remove acme-corp/api 12345         # by id
+```
+
+This removes the runner from GitHub. Local files (LaunchAgent, runner directory) are left in place so you can clean up at your own pace — the command tells you exactly what to do.
 
 ## Telegram alerts
 
