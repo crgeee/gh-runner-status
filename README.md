@@ -28,13 +28,11 @@ gh runner-status                                    # live dashboard (in a termi
 
 That's it.
 
-**Upgrades are free** (it's just pulling the latest from GitHub):
+**Upgrade** later:
 
 ```bash
 gh extension upgrade gh-runner-status
 ```
-
-The extension itself is **free and open source** (MIT license) — no subscription, no API key beyond your existing `gh auth`, no telemetry.
 
 **Uninstall:**
 
