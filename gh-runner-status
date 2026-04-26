@@ -575,6 +575,11 @@ local_runner_version() {
 # XDG_CACHE_HOME so it persists across script invocations and survives
 # /tmp clears. Writes are atomic (temp + rename).
 LATEST_VERSION_TTL_SECONDS="${LATEST_VERSION_TTL_SECONDS:-43200}"  # 12h
+# Validate: arithmetic comparison under set -e would crash the whole
+# script on a non-integer override. Fall back to the 12h default.
+if [[ ! "$LATEST_VERSION_TTL_SECONDS" =~ ^[0-9]+$ ]]; then
+  LATEST_VERSION_TTL_SECONDS=43200
+fi
 
 _latest_version_cache_path() {
   local base="${XDG_CACHE_HOME:-$HOME/.cache}/gh-runner-status"
@@ -1226,8 +1231,13 @@ dispatch_subcommand() {
       # patched in for crash recovery, starts it, verifies online.
       local repo="" runner_name="" labels="self-hosted" install_root="" yes=0
       local saw_repo=0
+      # Copy the positional array without re-splitting so values
+      # containing spaces (e.g. `--dir "/path with spaces"`) are
+      # preserved as single elements.
       local _args=()
-      _args=( ${positional[@]:+"${positional[@]}"} )
+      if [[ ${#positional[@]} -gt 0 ]]; then
+        _args=("${positional[@]}")
+      fi
       local i=0 n=${#_args[@]}
       while (( i < n )); do
         local a="${_args[i]}"
@@ -1349,10 +1359,20 @@ EOF
         if [[ -f "$plist" ]] && ! grep -q '<key>KeepAlive</key>' "$plist"; then
           echo "Adding KeepAlive to LaunchAgent for crash recovery..."
           # Insert <key>KeepAlive</key><true/> right before </dict>.
+          # Make the temp file in the SAME directory as the plist so
+          # the subsequent mv is a real atomic rename (would otherwise
+          # be a copy+delete across filesystems and could leave a
+          # partial write visible to launchd).
           local tmp
-          tmp=$(mktemp)
-          awk '/^[[:space:]]*<\/dict>$/ && !done { print "    <key>KeepAlive</key>"; print "    <true/>"; done=1 } { print }' \
-            "$plist" >"$tmp" && mv -f "$tmp" "$plist"
+          tmp=$(mktemp "${plist}.XXXXXX") || tmp=""
+          if [[ -n "$tmp" ]]; then
+            if awk '/^[[:space:]]*<\/dict>$/ && !done { print "    <key>KeepAlive</key>"; print "    <true/>"; done=1 } { print }' \
+                 "$plist" >"$tmp"; then
+              mv -f "$tmp" "$plist"
+            else
+              rm -f "$tmp"
+            fi
+          fi
           # Reload service so the change takes effect.
           ./svc.sh stop 2>/dev/null || true
         fi
@@ -1667,15 +1687,25 @@ EOF
           printf '  ✓ system sleep disabled (sleep=0)\n'
         fi
       elif [[ "$(detect_os)" == "linux" ]]; then
-        # systemd Restart= matters in the same way KeepAlive does on
-        # macOS — without it, a crashed runner stays down. We can't
-        # easily flip it from the tool, but we can flag.
-        local restart
-        restart=$(systemctl --user show -P Restart "actions.runner.*" 2>/dev/null | head -1)
-        if [[ -n "$restart" && "$restart" == "no" ]]; then
-          printf '  ⚠ systemd Restart=no on runner units — crashes will not auto-recover\n'
-          issues=$(( issues + 1 ))
-        fi
+        # systemd Restart= matters the same way KeepAlive does on
+        # macOS — without it, a crashed runner stays down. systemctl
+        # show doesn't expand globs, so we have to enumerate units
+        # first and check each one.
+        local units unit r
+        units=$( {
+          systemctl --user list-units --type=service --all --no-legend 'actions.runner.*' 2>/dev/null || true
+          systemctl list-units --type=service --all --no-legend 'actions.runner.*' 2>/dev/null || true
+        } | awk '{print $1}' | sort -u )
+        while IFS= read -r unit; do
+          [[ -z "$unit" ]] && continue
+          r=$(systemctl --user show -P Restart "$unit" 2>/dev/null \
+              || systemctl show -P Restart "$unit" 2>/dev/null || true)
+          if [[ -z "$r" || "$r" == "no" ]]; then
+            printf '  ⚠ %s has Restart=%s — crashes will not auto-recover\n' "$unit" "${r:-no}"
+            printf '      fix: edit the unit and add Restart=always (or on-failure)\n'
+            issues=$(( issues + 1 ))
+          fi
+        done <<<"$units"
       fi
 
       echo
