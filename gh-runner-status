@@ -675,16 +675,76 @@ run one-shot.
 EOF
 }
 
+render_repl_banner() {
+  local has_color="$1"
+  local short_host
+  short_host=${HOSTNAME%%.*}
+  [[ -z "$short_host" ]] && short_host=$(hostname 2>/dev/null || echo "")
+  local now
+  now=$(date '+%H:%M:%S')
+  if [[ $has_color -eq 1 ]]; then
+    printf '\033[1;36m▸ gh-runner-status\033[0m \033[2mv%s • %s • %s\033[0m\n' \
+      "$VERSION" "${short_host:-localhost}" "$now"
+  else
+    printf 'gh-runner-status v%s • %s • %s\n' "$VERSION" "${short_host:-localhost}" "$now"
+  fi
+}
+
+render_repl_footer() {
+  local has_color="$1"
+  if [[ $has_color -eq 1 ]]; then
+    printf '\033[2m─ commands: \033[0mlist\033[2m / \033[0mlocal\033[2m / \033[0mrestart NAME\033[2m / \033[0mwatch\033[2m / \033[0mnotify\033[2m   slash: \033[0m/help \033[2m·\033[0m /repos \033[2m·\033[0m /clear \033[2m·\033[0m /quit\033[0m\n'
+  else
+    printf '─ commands: list / local / restart NAME / watch / notify   slash: /help · /repos · /clear · /quit\n'
+  fi
+}
+
+# Render the active dashboard: banner, status table, footer. Used on
+# REPL entry and on /clear so the user always has live state visible
+# rather than a blank prompt.
+render_dashboard() {
+  local has_color="$1"
+  if [[ $has_color -eq 1 ]]; then
+    # Use the alternate screen? No — that hides scrollback. Just clear.
+    printf '\033[H\033[2J' 2>/dev/null || true
+  fi
+  render_repl_banner "$has_color"
+  echo
+
+  # Try to render the status table. If the config file is missing or
+  # there's a network failure, fall back to a friendly hint instead of
+  # a stack-trace-y error — the REPL is still usable for `local`,
+  # `/help`, etc.
+  local cfg="${CONFIG_FILE:-$(config_path)}"
+  if [[ -f "$cfg" ]] && [[ -s "$cfg" ]]; then
+    if ! dispatch_subcommand list 2>&1; then
+      # shellcheck disable=SC2016 # backticks here are intentional literal text in the user-facing hint
+      printf '\n\033[33m(could not fetch runner status — check `gh auth status` and try `list`)\033[0m\n'
+    fi
+  else
+    cat <<EOF
+no fleet configured yet. add one repo per line to:
+  $cfg
+
+example:
+  mkdir -p $(dirname "$cfg")
+  printf 'acme-corp/api\nacme-corp/web\n' > $cfg
+
+then type \`list\` (or \`l\`) to refresh.
+EOF
+  fi
+  echo
+  render_repl_footer "$has_color"
+  echo
+}
+
 interactive_mode() {
   local has_color=0
   [[ -t 1 ]] && has_color=1
 
-  if [[ $has_color -eq 1 ]]; then
-    printf '\033[1;36m▸ gh-runner-status\033[0m \033[2mv%s\033[0m\n' "$VERSION"
-    printf '\033[2mtype /help for commands • Ctrl-D to exit\033[0m\n\n'
-  else
-    printf 'gh-runner-status v%s — type /help for commands, Ctrl-D to exit\n\n' "$VERSION"
-  fi
+  # Active dashboard on launch — instead of a blank prompt, show the
+  # current fleet state, available commands, and slash shortcuts.
+  render_dashboard "$has_color"
 
   local prompt
   if [[ $has_color -eq 1 ]]; then
@@ -717,7 +777,8 @@ interactive_mode() {
         break
         ;;
       /clear|clear)
-        clear
+        # Re-render the dashboard with fresh state — same as launch.
+        render_dashboard "$has_color"
         ;;
       /repos)
         local f="${CONFIG_FILE:-$(config_path)}"

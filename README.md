@@ -23,7 +23,7 @@ Then:
 
 ```bash
 gh runner-status owner/repo                         # status of one repo
-gh runner-status                                    # interactive REPL
+gh runner-status                                    # interactive REPL (in a terminal)
 ```
 
 That's it.
@@ -71,28 +71,35 @@ gh runner-status notify                             # Telegram alert on issues
 
 The runner name passed to `start`/`stop`/`restart`/`logs` is the LaunchAgent label on macOS (`actions.runner.OWNER-REPO.NAME`) or the systemd service name on Linux. `gh runner-status local` shows you the names.
 
-## Interactive REPL
+## Interactive dashboard
 
-Run `gh runner-status` with no args (in a terminal) and you drop into a persistent prompt with slash commands and short aliases:
+Run `gh runner-status` with no args (in a terminal) and you land on a live dashboard — banner, status table, command bar — followed by a prompt for ad-hoc commands:
 
 ```
-▸ gh-runner-status v0.2.0
-type /help for commands • Ctrl-D to exit
+▸ gh-runner-status v0.2.0 • laptop • 14:32:01
 
-❯ list
   REPO            NAME        STATUS   BUSY  LABELS
 -----------------------------------------------------
 ✓ acme-corp/api   runner-1    online   no    self-hosted,linux,x64
+✓ acme-corp/api   runner-2    online   yes   self-hosted,linux,x64
 ✗ acme-corp/web   runner-1    offline  no    self-hosted,linux,x64
+
+─ commands: list / local / restart NAME / watch / notify   slash: /help · /repos · /clear · /quit
 
 ❯ restart actions.runner.acme-corp-web.runner-1
 restarted: actions.runner.acme-corp-web.runner-1
+
+❯ /clear     # re-renders the dashboard with fresh state
 
 ❯ /quit
 bye!
 ```
 
-Aliases inside the REPL: `l`/`ls` → `list`, `r` → `restart`, `s` → `start`, `x` → `stop`, `n` → `notify`, `w` → `watch`. Up-arrow recalls history within the session.
+`/clear` re-renders the dashboard so you can refresh-on-demand without leaving the REPL. Up-arrow recalls history within the session.
+
+**Aliases:** `l`/`ls` → `list`, `r` → `restart`, `s` → `start`, `x` → `stop`, `n` → `notify`, `w` → `watch`.
+
+For a *continuously* refreshing dashboard, use `gh runner-status watch` (defaults to 30s; pass an interval like `watch 5`).
 
 ## Telegram alerts
 
